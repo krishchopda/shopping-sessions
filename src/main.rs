@@ -867,10 +867,172 @@ fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
 }
 
 /// Visit every well-formed line of `data` as exactly N unquoted fields.
-/// Only commas and newlines are visited; a field's quotes are counted with
-/// popcnt on the quote bitmask and its wrapping is decided without branches.
+/// Quote validity is decided per 64-byte word with mask algebra: a quote is
+/// legal only at a field's first or last byte (and not both, i.e. a lone `"`
+/// field). Within a line with no illegal quote, a field is wrapped iff its
+/// first byte is a quote, and it is malformed iff exactly one end is a quote.
+/// `data` must start at a line start. A virtual newline is placed at `len`,
+/// so a final line without '\n' needs no special case.
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = data.len();
+    if len == 0 {
+        return;
+    }
+    let last = len - 1;
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut nf = 0usize;
+    let mut bad = false;
+    let mut fstart = 0usize;
+    let mut line_start = 0usize;
+    let mut carry_d = 1u64; // virtual delimiter before the first byte
+    let mut base = 0usize;
+    let mut tail;
+    while base <= len {
+        let (c, q, mut n) = if base + 64 <= len {
+            masks64(data[base..base + 64].try_into().unwrap())
+        } else {
+            tail = [0u8; 64];
+            tail[..len - base].copy_from_slice(&data[base..]);
+            let (c, q, n) = masks64(&tail);
+            (c, q, n | (1u64 << (len - base)))
+        };
+        if base + 64 > len {
+            // bits past the virtual newline are padding
+            let keep = u64::MAX >> (63 - (len - base));
+            n &= keep;
+        }
+        let d = c | n;
+        // is the byte right after this word a delimiter (or the virtual end)?
+        let next_d = if base + 64 < len {
+            let b = unsafe { *data.get_unchecked(base + 64) };
+            (b == b',') | (b == b'\n')
+        } else {
+            true
+        };
+        let s = (d << 1) | carry_d; // first byte of a field
+        let e = (d >> 1) | ((next_d as u64) << 63); // last byte of a field
+        let mut bw = q & !(s ^ e); // interior quote, or a lone-quote field
+        carry_d = d >> 63;
+        let mut m = d;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let pos = base + i;
+            let flen = pos - fstart;
+            let (fq, lq) = unsafe { (*data.get_unchecked(fstart.min(last)) == b'"', *data.get_unchecked(pos.wrapping_sub(1).min(last)) == b'"') };
+            let long = flen >= 2;
+            bad |= (fq & long) != (lq & long);
+            let w = (fq & long) as usize;
+            let v: &'a [u8] = unsafe { data.get_unchecked(fstart + w..pos - w) };
+            if nf < N {
+                fields[nf] = v;
+            } else {
+                bad = true;
+            }
+            nf += 1;
+            fstart = pos + 1;
+            if n >> i & 1 != 0 {
+                let upto = u64::MAX >> (63 - i);
+                bad |= bw & upto != 0;
+                bw &= !upto;
+                if !bad && nf == N && pos > line_start {
+                    f(&fields);
+                }
+                nf = 0;
+                bad = false;
+                line_start = pos + 1;
+            }
+        }
+        bad |= bw != 0;
+        base += 64;
+    }
+}
+
+/// Visit every well-formed line of `data` as exactly N unquoted fields.
+/// Only structural characters are touched; malformed lines are skipped.
+#[inline(always)]
+#[allow(dead_code)]
+fn scan_lines_ref<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = data.len();
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut nf = 0usize;
+    let mut bad = false;
+    let mut fstart = 0usize;
+    let mut nq = 0u32;
+    let mut qfirst = 0usize;
+    let mut qlast = 0usize;
+    let mut line_start = 0usize;
+
+    macro_rules! close_field {
+        ($pos:expr) => {{
+            let pos = $pos;
+            let v: &'a [u8] = if nq == 0 {
+                &data[fstart..pos]
+            } else if nq == 2 && qfirst == fstart && qlast + 1 == pos {
+                &data[fstart + 1..pos - 1]
+            } else {
+                bad = true;
+                &[]
+            };
+            if nf < N {
+                fields[nf] = v;
+            } else {
+                bad = true;
+            }
+            nf += 1;
+            nq = 0;
+            fstart = pos + 1;
+        }};
+    }
+
+    let mut base = 0usize;
+    let mut tail;
+    while base < len {
+        let (c, q, n) = if base + 64 <= len {
+            masks64(data[base..base + 64].try_into().unwrap())
+        } else {
+            tail = [0u8; 64];
+            tail[..len - base].copy_from_slice(&data[base..]);
+            masks64(&tail)
+        };
+        let mut m = c | q | n;
+        while m != 0 {
+            let i = m.trailing_zeros();
+            let bit = 1u64 << i;
+            m &= m - 1;
+            let pos = base + i as usize;
+            if q & bit != 0 {
+                if nq == 0 {
+                    qfirst = pos;
+                }
+                qlast = pos;
+                nq += 1;
+            } else {
+                close_field!(pos);
+                if n & bit != 0 {
+                    if !bad && nf == N && pos > line_start {
+                        f(&fields);
+                    }
+                    nf = 0;
+                    bad = false;
+                    line_start = pos + 1;
+                }
+            }
+        }
+        base += 64;
+    }
+    if line_start < len {
+        close_field!(len);
+        if !bad && nf == N {
+            f(&fields);
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn scan_lines_old<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = data.len();
     let mut fields: [&'a [u8]; N] = [&[]; N];
     let mut nf = 0usize;
@@ -954,85 +1116,27 @@ fn scan_lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; 
     }
 }
 
-/// Visit every well-formed line of `data` as exactly N unquoted fields.
-/// Only structural characters are touched; malformed lines are skipped.
-#[inline(always)]
+
 #[allow(dead_code)]
-fn scan_lines_ref<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
-    let len = data.len();
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut nf = 0usize;
-    let mut bad = false;
-    let mut fstart = 0usize;
-    let mut nq = 0u32;
-    let mut qfirst = 0usize;
-    let mut qlast = 0usize;
-    let mut line_start = 0usize;
-
-    macro_rules! close_field {
-        ($pos:expr) => {{
-            let pos = $pos;
-            let v: &'a [u8] = if nq == 0 {
-                &data[fstart..pos]
-            } else if nq == 2 && qfirst == fstart && qlast + 1 == pos {
-                &data[fstart + 1..pos - 1]
-            } else {
-                bad = true;
-                &[]
-            };
-            if nf < N {
-                fields[nf] = v;
-            } else {
-                bad = true;
-            }
-            nf += 1;
-            nq = 0;
-            fstart = pos + 1;
-        }};
+fn scan_bench(path: &Path) {
+    let data = fs::read(path).unwrap();
+    let data = &data[..data.len().min(400 << 20)];
+    let cut = data.iter().rposition(|&b| b == b'\n').unwrap() + 1;
+    let data = &data[..cut];
+    let (mut bo, mut bn) = (f64::MAX, f64::MAX);
+    for _ in 0..7 {
+        let t = std::time::Instant::now();
+        let mut acc = 0usize;
+        scan_lines_old(data, |f: &[&[u8]; 7]| acc = acc.wrapping_add(f[2].len() ^ f[6].len()));
+        bo = bo.min(t.elapsed().as_secs_f64());
+        let t = std::time::Instant::now();
+        let mut acc2 = 0usize;
+        scan_lines(data, |f: &[&[u8]; 7]| acc2 = acc2.wrapping_add(f[2].len() ^ f[6].len()));
+        bn = bn.min(t.elapsed().as_secs_f64());
+        assert_eq!(acc, acc2);
     }
-
-    let mut base = 0usize;
-    let mut tail;
-    while base < len {
-        let (c, q, n) = if base + 64 <= len {
-            masks64(data[base..base + 64].try_into().unwrap())
-        } else {
-            tail = [0u8; 64];
-            tail[..len - base].copy_from_slice(&data[base..]);
-            masks64(&tail)
-        };
-        let mut m = c | q | n;
-        while m != 0 {
-            let i = m.trailing_zeros();
-            let bit = 1u64 << i;
-            m &= m - 1;
-            let pos = base + i as usize;
-            if q & bit != 0 {
-                if nq == 0 {
-                    qfirst = pos;
-                }
-                qlast = pos;
-                nq += 1;
-            } else {
-                close_field!(pos);
-                if n & bit != 0 {
-                    if !bad && nf == N && pos > line_start {
-                        f(&fields);
-                    }
-                    nf = 0;
-                    bad = false;
-                    line_start = pos + 1;
-                }
-            }
-        }
-        base += 64;
-    }
-    if line_start < len {
-        close_field!(len);
-        if !bad && nf == N {
-            f(&fields);
-        }
-    }
+    let lines = data.iter().filter(|&&b| b == b'\n').count() as f64;
+    eprintln!("old {:.1} ns/line  new {:.1} ns/line", bo * 1e9 / lines, bn * 1e9 / lines);
 }
 
 // ---------------------------------------------------------------- parallel helper
@@ -1169,6 +1273,10 @@ fn flush_day(st: &mut SessSt, person: u64, day: i64, s: i64, ev: i64, rv: i64) {
 }
 
 fn main() {
+    if let Ok(p) = std::env::var("X_SCANBENCH") {
+        scan_bench(Path::new(&p));
+        return;
+    }
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
     let nt: usize = std::env::var("NCPU")
@@ -1226,6 +1334,9 @@ fn main() {
     let ev_files = open_files(&list_csv(&data_dir.join("events")));
     let ck_files = open_files(&list_csv(&data_dir.join("clicks")));
     let total_tasks = ev_chunks.len() + ck_chunks.len();
+    // bench switches: X_MMAP reads chunks in place; X_STOP exits right after parsing
+    let use_mmap = std::env::var("X_MMAP").is_ok();
+    let stop_after_parse = std::env::var("X_STOP").is_ok();
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
     // Bucket counts follow the input size so each bucket's working set
@@ -1265,7 +1376,7 @@ fn main() {
             if i < ev_chunks.len() {
                 let c = &ev_chunks[i];
                 let mut buf = std::mem::take(&mut st.buf);
-                let data: &[u8] = read_chunk(&mut buf, &ev_files[c.file], c);
+                let data: &[u8] = if use_mmap { &ev_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ev_files[c.file], c) };
                 scan_lines(data, |f: &[&[u8]; 7]| {
                     if f[0].is_empty() {
                         return;
@@ -1315,7 +1426,7 @@ fn main() {
                 // thread has normally finished by the time one starts
                 let (po, _) = links.wait();
                 let mut buf = std::mem::take(&mut st.buf);
-                let data: &[u8] = read_chunk(&mut buf, &ck_files[c.file], c);
+                let data: &[u8] = if use_mmap { &ck_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ck_files[c.file], c) };
                 scan_lines(data, |f: &[&[u8]; 4]| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
@@ -1356,6 +1467,9 @@ fn main() {
         st.ckb.finish();
     }
     lap("parse events+clicks");
+    if stop_after_parse {
+        unsafe { libc::_exit(0) };
+    }
     link_handle.join().unwrap();
     let (person_of, mut reg) = Arc::try_unwrap(links).ok().expect("links still shared").into_inner().expect("links built");
     for st in &mut parsed {
@@ -1950,17 +2064,17 @@ mod tests {
     }
     #[test]
     fn scanner_matches_reference() {
-        let pieces: [&[u8]; 14] = [b"ab", b"\"x\"", b"\"\"", b"\"", b"", b"long_field_value_that_goes_on_and_on_and_on_and_on_xx", b"\r", b" a ", b"\"a\"b\"", b"1234567890", b"\"q", b"q\"", b"z", b"\"\"\""];
+        let pieces: [&[u8]; 18] = [b"a\"b", b"\"a\"\"", b"\"\"x", b"x\"\"", b"ab", b"\"x\"", b"\"\"", b"\"", b"", b"long_field_value_that_goes_on_and_on_and_on_and_on_xx", b"\r", b" a ", b"\"a\"b\"", b"1234567890", b"\"q", b"q\"", b"z", b"\"\"\""];
         let mut x: u64 = 99;
         let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
-        for _ in 0..3000 {
+        for _ in 0..60000 {
             let mut d = vec![];
             let lines = rnd() % 40;
             for _ in 0..lines {
                 let nf = 1 + rnd() % 5;
                 for k in 0..nf {
                     if k > 0 { d.push(b','); }
-                    d.extend_from_slice(pieces[(rnd() % 14) as usize]);
+                    d.extend_from_slice(pieces[(rnd() % 18) as usize]);
                 }
                 if rnd() % 50 != 0 { d.push(b'\n'); } else { d.extend_from_slice(b"\n\n"); }
             }
