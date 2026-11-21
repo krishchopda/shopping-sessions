@@ -529,16 +529,17 @@ impl U64Map {
 
 // ---------------------------------------------------------------- records
 
+/// 28 bytes, packed: fewer bytes streamed to memory by the parser.
 #[derive(Clone, Copy)]
+#[repr(C, packed)]
 struct Ev {
     eid: u64,
     person: u64,
-    ts: u32,     // ms since window_start (valid events only)
+    ts: u32,     // ms since window_start; INVALID_TS if the copy fails validation
     ingest: i32, // whole seconds relative to window_start
-    price: u32,
-    cat: u16,
-    flags: u8, // bit0 valid, bit1 purchase
+    pc: u32,     // price << 8 | category for a valid purchase, else 0
 }
+const INVALID_TS: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct Sv {
@@ -1185,6 +1186,7 @@ fn main() {
     let we = manifest_ts(&manifest, "\"window_end\"");
     let cws = ws - WEEK;
     let day0 = ws.div_euclid(DAY);
+    assert!(we - ws < INVALID_TS as i64, "window too long for 32-bit offsets");
     fill_date_tab(day0 - 10, (we - 1).div_euclid(DAY) + 7);
     let nd = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
 
@@ -1295,15 +1297,15 @@ fn main() {
                     if valid && ingest_ms - ts > DAY {
                         valid = false;
                     }
-                    let flags = valid as u8 | ((purchase as u8) << 1);
                     if valid {
                         let uid = key_of_padded(f[1], &mut st.reg);
                         let cat = if purchase { prod_lu.get(f[5]).map(|c| c as u16).unwrap_or(unknown_cat) } else { 0 };
                         let b = (mix(eid) >> (64 - ev_bits)) as usize;
-                        st.evb.push(b, Ev { eid, person: uid, ts: (ts - ws) as u32, ingest, price, cat, flags });
+                        let pc = if purchase { (price << 8) | cat as u32 } else { 0 };
+                        st.evb.push(b, Ev { eid, person: uid, ts: (ts - ws) as u32, ingest, pc });
                     } else {
                         let b = (mix(eid) >> (64 - ev_bits)) as usize;
-                        st.evb.push(b, Ev { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, flags });
+                        st.evb.push(b, Ev { eid, person: 0, ts: INVALID_TS, ingest, pc: 0 });
                     }
                 });
                 st.buf = buf;
@@ -1420,11 +1422,11 @@ fn main() {
                         li += 1;
                         continue;
                     }
-                    if e.flags & 1 == 0 {
+                    if e.ts == INVALID_TS {
                         continue;
                     }
                     person_of_ref.prefetch(e.person);
-                    pend.push(Sv { person: e.person, ts: e.ts, pc: if e.flags & 2 != 0 { (e.price << 8) | e.cat as u32 } else { 0 } });
+                    pend.push(Sv { person: e.person, ts: e.ts, pc: e.pc });
                     if pend.len() == BATCH {
                         for mut v in pend.drain(..) {
                             v.person = person_of_ref.get(v.person).unwrap_or(v.person);
