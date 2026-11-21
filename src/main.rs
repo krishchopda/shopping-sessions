@@ -636,7 +636,7 @@ impl<T: Copy> Buckets<T> {
                 0,
             );
             assert!(p != libc::MAP_FAILED, "mmap slab");
-            if std::env::var_os("X_THP").is_some() {
+            if std::env::var_os("X_NOTHP").is_none() {
                 libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
             }
             p as *mut T
