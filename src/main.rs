@@ -496,10 +496,8 @@ struct Ev {
 #[derive(Clone, Copy)]
 struct Sv {
     person: u64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    purchase: bool,
+    ts: u32, // ms since window_start
+    pc: u32, // price << 8 | category; price 0 = not a purchase
 }
 
 #[derive(Clone, Copy)]
@@ -921,6 +919,74 @@ struct SessSt {
     touched: Vec<u16>,
     evs: Vec<Sv>,
     cks: Vec<Ck>,
+    pt: PTab,
+    pidx: Vec<u32>,
+    cidx: Vec<u32>,
+    persons: Vec<u64>,
+    eoff: Vec<u32>,
+    coff: Vec<u32>,
+    cur: Vec<u32>,
+}
+
+/// Person -> dense index, open addressing, grows at half load.
+struct PTab {
+    mask: usize,
+    e: Vec<(u64, u32)>,
+}
+impl PTab {
+    fn reset(&mut self, hint: usize) {
+        let cap = (hint * 2).next_power_of_two().max(64);
+        self.mask = cap - 1;
+        self.e.clear();
+        self.e.resize(cap, (u64::MAX, 0));
+    }
+    #[inline(always)]
+    fn get_or_insert(&mut self, k: u64, persons: &mut Vec<u64>) -> u32 {
+        let mut i = (mix(k) >> 24) as usize & self.mask;
+        loop {
+            let x = self.e[i];
+            if x.0 == k {
+                return x.1;
+            }
+            if x.0 == u64::MAX {
+                let ix = persons.len() as u32;
+                persons.push(k);
+                self.e[i] = (k, ix);
+                if persons.len() * 2 > self.e.len() {
+                    self.grow(persons);
+                }
+                return ix;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    fn grow(&mut self, persons: &[u64]) {
+        let cap = self.e.len() * 2;
+        self.mask = cap - 1;
+        self.e.clear();
+        self.e.resize(cap, (u64::MAX, 0));
+        for (ix, &k) in persons.iter().enumerate() {
+            let mut i = (mix(k) >> 24) as usize & self.mask;
+            while self.e[i].0 != u64::MAX {
+                i = (i + 1) & self.mask;
+            }
+            self.e[i] = (k, ix as u32);
+        }
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> u32 {
+        let mut i = (mix(k) >> 24) as usize & self.mask;
+        loop {
+            let x = self.e[i];
+            if x.0 == k {
+                return x.1;
+            }
+            if x.0 == u64::MAX {
+                return u32::MAX;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
 }
 
 fn flush_day(st: &mut SessSt, person: u64, day: i64, s: i64, ev: i64, rv: i64) {
@@ -972,6 +1038,7 @@ fn main() {
         .collect();
     let prod_lu = Lookup::new(b"p", &prod_items);
     let ncat = cat_names.len();
+    assert!(ncat <= 256, "too many categories");
 
     let camps = read_small(&data_dir.join("campaigns.csv"));
     let camp_items: Vec<(Vec<u8>, u32)> = camps.iter().enumerate().map(|(i, (c, _))| (c.clone(), i as u32)).collect();
@@ -1207,7 +1274,7 @@ fn main() {
                         continue;
                     }
                     person_of_ref.prefetch(e.person);
-                    pend.push(Sv { person: e.person, ts: ws + e.ts as i64, price: e.price, cat: e.cat, purchase: e.flags & 2 != 0 });
+                    pend.push(Sv { person: e.person, ts: e.ts, pc: if e.flags & 2 != 0 { (e.price << 8) | e.cat as u32 } else { 0 } });
                     if pend.len() == BATCH {
                         for mut v in pend.drain(..) {
                             v.person = person_of_ref.get(v.person).unwrap_or(v.person);
@@ -1249,54 +1316,120 @@ fn main() {
             touched: Vec::new(),
             evs: Vec::new(),
             cks: Vec::new(),
+            pt: PTab { mask: 0, e: Vec::new() },
+            pidx: Vec::new(),
+            cidx: Vec::new(),
+            persons: Vec::new(),
+            eoff: Vec::new(),
+            coff: Vec::new(),
+            cur: Vec::new(),
         },
         |st, b| {
-            let mut evs = std::mem::take(&mut st.evs);
-            evs.clear();
-            for (o, _, _, _) in dedup_ref.iter() {
-                let (m0, m1) = o.parts(b);
-                evs.extend_from_slice(m0);
-                evs.extend_from_slice(m1);
-            }
-            if evs.is_empty() {
-                st.evs = evs;
+            // Group by person in linear time: dense person index via a small
+            // hash table, counting sort by index, then sort each person's few
+            // records by time.
+            let n: usize = dedup_ref.iter().map(|d| d.0.len(b)).sum();
+            if n == 0 {
                 return;
             }
-            evs.sort_unstable_by_key(|e| (e.person, e.ts));
+            let mut evs = std::mem::take(&mut st.evs);
             let mut cks = std::mem::take(&mut st.cks);
-            cks.clear();
+            st.pt.reset(n / 8 + 64);
+            st.pidx.clear();
+            st.persons.clear();
+            for (o, _, _, _) in dedup_ref.iter() {
+                let (m0, m1) = o.parts(b);
+                for e in m0.iter().chain(m1.iter()) {
+                    let ix = st.pt.get_or_insert(e.person, &mut st.persons);
+                    st.pidx.push(ix);
+                }
+            }
+            let np = st.persons.len();
+            st.eoff.clear();
+            st.eoff.resize(np + 1, 0);
+            for &ix in &st.pidx {
+                st.eoff[ix as usize + 1] += 1;
+            }
+            for k in 0..np {
+                st.eoff[k + 1] += st.eoff[k];
+            }
+            st.cur.clear();
+            st.cur.extend_from_slice(&st.eoff[..np]);
+            evs.clear();
+            evs.reserve(n);
+            unsafe { evs.set_len(n) };
+            let mut k = 0usize;
+            for (o, _, _, _) in dedup_ref.iter() {
+                let (m0, m1) = o.parts(b);
+                for e in m0.iter().chain(m1.iter()) {
+                    let ix = st.pidx[k] as usize;
+                    k += 1;
+                    let at = st.cur[ix];
+                    st.cur[ix] = at + 1;
+                    evs[at as usize] = *e;
+                }
+            }
+            for q in 0..np {
+                let (x, y) = (st.eoff[q] as usize, st.eoff[q + 1] as usize);
+                if y - x > 1 {
+                    evs[x..y].sort_unstable_by_key(|e| e.ts);
+                }
+            }
+            // clicks of the same people (clicks of people without events are dropped)
+            st.cidx.clear();
+            st.coff.clear();
+            st.coff.resize(np + 1, 0);
             for s in ck_parts_ref {
                 let (m0, m1) = s.parts(b);
-                cks.extend_from_slice(m0);
-                cks.extend_from_slice(m1);
+                for c in m0.iter().chain(m1.iter()) {
+                    let ix = st.pt.get(c.person);
+                    st.cidx.push(ix);
+                    if ix != u32::MAX {
+                        st.coff[ix as usize + 1] += 1;
+                    }
+                }
             }
-            cks.sort_unstable_by_key(|c| (c.person, c.ts));
+            for q in 0..np {
+                st.coff[q + 1] += st.coff[q];
+            }
+            let nc = st.coff[np] as usize;
+            st.cur.clear();
+            st.cur.extend_from_slice(&st.coff[..np]);
+            cks.clear();
+            cks.reserve(nc);
+            unsafe { cks.set_len(nc) };
+            let mut k = 0usize;
+            for s in ck_parts_ref {
+                let (m0, m1) = s.parts(b);
+                for c in m0.iter().chain(m1.iter()) {
+                    let ix = st.cidx[k];
+                    k += 1;
+                    if ix == u32::MAX {
+                        continue;
+                    }
+                    let at = st.cur[ix as usize];
+                    st.cur[ix as usize] = at + 1;
+                    cks[at as usize] = *c;
+                }
+            }
+            for q in 0..np {
+                let (x, y) = (st.coff[q] as usize, st.coff[q + 1] as usize);
+                if y - x > 1 {
+                    cks[x..y].sort_unstable_by_key(|c| c.ts);
+                }
+            }
 
-            let mut ci = 0usize;
-            let mut i = 0usize;
-            while i < evs.len() {
-                let p = evs[i].person;
-                let mut j = i;
-                while j < evs.len() && evs[j].person == p {
-                    j += 1;
-                }
-                while ci < cks.len() && cks[ci].person < p {
-                    ci += 1;
-                }
-                let mut ce = ci;
-                while ce < cks.len() && cks[ce].person == p {
-                    ce += 1;
-                }
-                let pc = &cks[ci..ce];
-                ci = ce;
-
+            for q in 0..np {
+                let p = st.persons[q];
+                let (i, j) = (st.eoff[q] as usize, st.eoff[q + 1] as usize);
+                let pc = &cks[st.coff[q] as usize..st.coff[q + 1] as usize];
                 let (mut lo, mut hi) = (0usize, 0usize);
                 let mut cur_day: i64 = i64::MIN;
                 let (mut d_sess, mut d_events, mut d_rev) = (0i64, 0i64, 0i64);
 
                 let mut k = i;
                 while k < j {
-                    let start = evs[k].ts;
+                    let start = ws + evs[k].ts as i64;
                     let day = start.div_euclid(DAY);
                     if day != cur_day {
                         if cur_day != i64::MIN {
@@ -1307,21 +1440,22 @@ fn main() {
                         d_events = 0;
                         d_rev = 0;
                     }
-                    let mut last = start;
+                    let mut last = evs[k].ts;
                     let mut m = k;
                     let mut rev = 0i64;
                     let mut purch = false;
-                    while m < j && evs[m].ts - last <= GAP {
+                    while m < j && (evs[m].ts - last) as i64 <= GAP {
                         let e = &evs[m];
                         last = e.ts;
-                        if e.purchase {
+                        if e.pc != 0 {
+                            let price = (e.pc >> 8) as i64;
+                            let c = (e.pc & 255) as usize;
                             purch = true;
-                            rev += e.price as i64;
-                            let c = e.cat as usize;
+                            rev += price;
                             if st.catsum[c] == 0 {
-                                st.touched.push(e.cat);
+                                st.touched.push(c as u16);
                             }
-                            st.catsum[c] += e.price as i64;
+                            st.catsum[c] += price;
                         }
                         m += 1;
                     }
@@ -1381,7 +1515,6 @@ fn main() {
                     st.cnt[c as usize] = 0;
                 }
                 st.active.clear();
-                i = j;
             }
             st.evs = evs;
             st.cks = cks;
