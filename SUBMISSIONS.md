@@ -35,3 +35,6 @@ noise between machines is up to ~20%, so compare with care.
 - BB-7DBB92F3 — F+static (crt-static, x86-64-v3) @ 03fd731 — **1.18 s** (neutral; within ±20% noise)
 - Board: rank ~111/273. Top: 0.30 / 0.31 / 0.31 / 0.42. Top entries decode generator-scrambled IDs to dense indices (authors opted out of reuse; rules forbid dataset-specific hard-coding) — not pursued.
 - Next: fuse post-dedup passes (group+sessions+attribution), batched field extraction, minimal Parquet writer.
+- BB-DC1C92B8 — hot @ 925e82e: mask-algebra scanner (local bench 42 -> 37 ns/line) — **1.21 s**
+- BB-05E28C9C — nt-off @ f94c9ec: same + cached slab stores — **1.22 s**
+- Lesson: the local scanner gain did not show on the scorer (slightly worse, ~3%, within drift). Cached vs non-temporal stores: no difference.
