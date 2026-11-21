@@ -38,3 +38,5 @@ noise between machines is up to ~20%, so compare with care.
 - BB-DC1C92B8 — hot @ 925e82e: mask-algebra scanner (local bench 42 -> 37 ns/line) — **1.21 s**
 - BB-05E28C9C — nt-off @ f94c9ec: same + cached slab stores — **1.22 s**
 - Lesson: the local scanner gain did not show on the scorer (slightly worse, ~3%, within drift). Cached vs non-temporal stores: no difference.
+- BB-E59E1813 — control rerun of F+PGO @ 82847cb — **1.19 s** (same code scored 1.17 earlier: ~2% drift)
+- BB-E0BC035F — hot @ 5b244c4: branch-free time-of-day, SWAR 13-digit epoch, word-compare event type (bench 83 -> 57 ns/line) — **1.08 s** NEW BEST
