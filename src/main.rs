@@ -1185,6 +1185,7 @@ fn main() {
     let we = manifest_ts(&manifest, "\"window_end\"");
     let cws = ws - WEEK;
     let day0 = ws.div_euclid(DAY);
+    assert!(we - ws < u32::MAX as i64, "window too long for 32-bit offsets");
     fill_date_tab(day0 - 10, (we - 1).div_euclid(DAY) + 7);
     let nd = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
 
@@ -1423,20 +1424,11 @@ fn main() {
                     if e.flags & 1 == 0 {
                         continue;
                     }
-                    person_of_ref.prefetch(e.person);
-                    pend.push(Sv { person: e.person, ts: e.ts, pc: if e.flags & 2 != 0 { (e.price << 8) | e.cat as u32 } else { 0 } });
-                    if pend.len() == BATCH {
-                        for mut v in pend.drain(..) {
-                            v.person = person_of_ref.get(v.person).unwrap_or(v.person);
-                            out.push((mix(v.person) >> (64 - pb_bits)) as usize, v);
-                        }
-                    }
+                    // route by the raw user ID; persons are resolved per bucket later
+                    out.push((mix(e.person) >> (64 - pb_bits)) as usize, Sv { person: e.person, ts: e.ts, pc: if e.flags & 2 != 0 { (e.price << 8) | e.cat as u32 } else { 0 } });
                 }
             }
-            for mut v in pend.drain(..) {
-                v.person = person_of_ref.get(v.person).unwrap_or(v.person);
-                out.push((mix(v.person) >> (64 - pb_bits)) as usize, v);
-            }
+            let _ = &pend;
         },
     );
     for st in &mut parsed {
@@ -1448,8 +1440,61 @@ fn main() {
     }
     lap("dedup");
 
-    // ---- sessions
-    let dedup_ref = &dedup;
+    // ---- resolve persons per raw-uid bucket with an L2-sized slice of the link map
+    let mut lparts: Vec<Vec<(u64, u64)>> = (0..n_pb).map(|_| Vec::new()).collect();
+    for kv in person_of.e.iter() {
+        if kv[0] != u64::MAX {
+            lparts[(mix(kv[0]) >> (64 - pb_bits)) as usize].push((kv[0], kv[1]));
+        }
+    }
+    let lparts_ref = &lparts;
+    let dedup_in = &dedup;
+    // A record whose user ID is its person's name is already in the right
+    // bucket and stays in place; only the others are moved (and their slot
+    // marked dead with ts = u32::MAX).
+    let mut resolved = par_for(
+        nt,
+        n_pb,
+        || Buckets::<Sv>::new(n_pb, sv_res / 2 + 64),
+        |out, b| {
+            let lp = &lparts_ref[b];
+            if lp.is_empty() {
+                return;
+            }
+            let mut m = U64Map::with_capacity(lp.len() + 8);
+            for &(k, v) in lp {
+                m.insert(k, v);
+            }
+            for (o, _, _, _) in dedup_in.iter() {
+                let (m0, m1) = o.parts(b);
+                for part in [m0, m1] {
+                    // this task is the only one touching bucket b of any slab
+                    let ptr = part.as_ptr() as *mut Sv;
+                    for i in 0..part.len() {
+                        let v = unsafe { &mut *ptr.add(i) };
+                        if let Some(p) = m.get(v.person) {
+                            if p != v.person {
+                                let mut w = *v;
+                                w.person = p;
+                                out.push((mix(p) >> (64 - pb_bits)) as usize, w);
+                                v.ts = u32::MAX;
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    );
+    for r in &mut resolved {
+        r.finish();
+    }
+    drop(lparts);
+    lap("resolve");
+
+    // ---- sessions: each bucket = records kept in place + records moved in
+    let dedup_ref: Vec<(&Buckets<Sv>, (), (), ())> =
+        dedup.iter().map(|d| (&d.0, (), (), ())).chain(resolved.iter().map(|r| (r, (), (), ()))).collect();
+    let dedup_ref = &dedup_ref;
     let ck_parts_ref = &ck_parts;
     let parsed_ref = &parsed;
     let reg_ref = &reg;
@@ -1490,6 +1535,10 @@ fn main() {
             for (o, _, _, _) in dedup_ref.iter() {
                 let (m0, m1) = o.parts(b);
                 for e in m0.iter().chain(m1.iter()) {
+                    if e.ts == u32::MAX {
+                        st.pidx.push(u32::MAX);
+                        continue;
+                    }
                     let ix = st.pt.get_or_insert(e.person, &mut st.persons);
                     st.pidx.push(ix);
                 }
@@ -1498,7 +1547,9 @@ fn main() {
             st.eoff.clear();
             st.eoff.resize(np + 1, 0);
             for &ix in &st.pidx {
-                st.eoff[ix as usize + 1] += 1;
+                if ix != u32::MAX {
+                    st.eoff[ix as usize + 1] += 1;
+                }
             }
             for k in 0..np {
                 st.eoff[k + 1] += st.eoff[k];
@@ -1506,14 +1557,19 @@ fn main() {
             st.cur.clear();
             st.cur.extend_from_slice(&st.eoff[..np]);
             evs.clear();
-            evs.reserve(n);
-            unsafe { evs.set_len(n) };
+            let n_live = st.eoff[np] as usize;
+            evs.reserve(n_live);
+            unsafe { evs.set_len(n_live) };
             let mut k = 0usize;
             for (o, _, _, _) in dedup_ref.iter() {
                 let (m0, m1) = o.parts(b);
                 for e in m0.iter().chain(m1.iter()) {
-                    let ix = st.pidx[k] as usize;
+                    let ix = st.pidx[k];
                     k += 1;
+                    if ix == u32::MAX {
+                        continue;
+                    }
+                    let ix = ix as usize;
                     let at = st.cur[ix];
                     st.cur[ix] = at + 1;
                     evs[at as usize] = *e;
@@ -1670,7 +1726,6 @@ fn main() {
             st.cks = cks;
         },
     );
-    drop(dedup);
     lap("sessions");
 
     // ---- output
