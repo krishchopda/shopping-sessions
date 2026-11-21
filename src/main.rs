@@ -577,7 +577,7 @@ unsafe impl<T: Copy + Sync> Sync for Buckets<T> {}
 
 /// Non-temporal slab stores (default on); X_NT=0 switches to cached stores.
 static USE_NT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(DEFAULT_NT);
-const DEFAULT_NT: bool = true;
+const DEFAULT_NT: bool = false;
 
 #[inline(always)]
 unsafe fn stream_copy<T: Copy>(dst: *mut T, src: *const T, n: usize) {
