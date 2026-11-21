@@ -575,11 +575,15 @@ struct Buckets<T: Copy> {
 unsafe impl<T: Copy + Send> Send for Buckets<T> {}
 unsafe impl<T: Copy + Sync> Sync for Buckets<T> {}
 
+/// Non-temporal slab stores (default on); X_NT=0 switches to cached stores.
+static USE_NT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(DEFAULT_NT);
+const DEFAULT_NT: bool = true;
+
 #[inline(always)]
 unsafe fn stream_copy<T: Copy>(dst: *mut T, src: *const T, n: usize) {
     let bytes = n * std::mem::size_of::<T>();
     #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
-    {
+    if USE_NT.load(Ordering::Relaxed) {
         use std::arch::x86_64::*;
         if bytes % 32 == 0 && (dst as usize) % 32 == 0 {
             let mut o = 0;
@@ -1273,6 +1277,9 @@ fn flush_day(st: &mut SessSt, person: u64, day: i64, s: i64, ev: i64, rv: i64) {
 }
 
 fn main() {
+    if let Ok(v) = std::env::var("X_NT") {
+        USE_NT.store(v != "0", Ordering::Relaxed);
+    }
     if let Ok(p) = std::env::var("X_SCANBENCH") {
         scan_bench(Path::new(&p));
         return;
