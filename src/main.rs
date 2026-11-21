@@ -517,15 +517,49 @@ impl Lookup {
 struct U64Map {
     mask: usize,
     e: Vec<[u64; 2]>,
+    /// optional membership filter (1 bit per hash slot): a clear bit = absent
+    filt: Vec<u64>,
 }
 impl U64Map {
     fn with_capacity(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
-        U64Map { mask: cap - 1, e: vec![[u64::MAX, 0]; cap] }
+        U64Map { mask: cap - 1, e: vec![[u64::MAX, 0]; cap], filt: Vec::new() }
     }
     #[inline(always)]
     fn start(&self, k: u64) -> usize {
         (mix(k) >> 20) as usize & self.mask
+    }
+    const FBITS: u32 = 24;
+    /// Build the membership filter from the stored keys.
+    fn build_filter(&mut self) {
+        let mut f = vec![0u64; 1 << (Self::FBITS - 6)];
+        for &[k, _] in &self.e {
+            if k != u64::MAX {
+                let h = (mix(k) >> (64 - Self::FBITS)) as usize;
+                f[h >> 6] |= 1 << (h & 63);
+            }
+        }
+        self.filt = f;
+    }
+    #[inline(always)]
+    fn maybe(&self, k: u64) -> bool {
+        let h = (mix(k) >> (64 - Self::FBITS)) as usize;
+        unsafe { *self.filt.get_unchecked(h >> 6) >> (h & 63) & 1 != 0 }
+    }
+    /// get() behind the filter; the filter must have been built.
+    #[inline(always)]
+    fn get_f(&self, k: u64) -> Option<u64> {
+        if self.maybe(k) {
+            self.get(k)
+        } else {
+            None
+        }
+    }
+    #[inline(always)]
+    fn prefetch_f(&self, k: u64) {
+        if self.maybe(k) {
+            self.prefetch(k);
+        }
     }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
@@ -610,6 +644,13 @@ unsafe impl<T: Copy + Send> Send for Buckets<T> {}
 unsafe impl<T: Copy + Sync> Sync for Buckets<T> {}
 
 /// Non-temporal slab stores (default on); X_NT=0 switches to cached stores.
+static PROF: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+#[inline(always)]
+fn prof(i: usize, t: std::time::Instant) -> std::time::Instant {
+    let n = std::time::Instant::now();
+    PROF[i].fetch_add((n - t).as_nanos() as usize, Ordering::Relaxed);
+    n
+}
 static USE_NT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(DEFAULT_NT);
 const DEFAULT_NT: bool = true;
 
@@ -1421,7 +1462,9 @@ fn main() {
     let ck_files = open_files(&list_csv(&data_dir.join("clicks")));
     let total_tasks = ev_chunks.len() + ck_chunks.len();
     // bench switches: X_MMAP reads chunks in place; X_STOP exits right after parsing
-    let use_mmap = std::env::var("X_MMAP").is_ok();
+    // Read chunks straight from the page cache (no copy). The last chunk of a
+    // file is copied into a padded buffer, since ID packing over-reads 16 bytes.
+    let use_mmap = std::env::var_os("X_PREAD").is_none();
     let stop_after_parse = std::env::var("X_STOP").is_ok();
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
@@ -1462,7 +1505,7 @@ fn main() {
             if i < ev_chunks.len() {
                 let c = &ev_chunks[i];
                 let mut buf = std::mem::take(&mut st.buf);
-                let data: &[u8] = if use_mmap { &ev_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ev_files[c.file], c) };
+                let data: &[u8] = if use_mmap && c.end + 64 <= ev_maps[c.file].len() { &ev_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ev_files[c.file], c) };
                 scan_lines(data, |f: &[&[u8]; 7]| {
                     if f[0].is_empty() {
                         return;
@@ -1512,7 +1555,7 @@ fn main() {
                 // thread has normally finished by the time one starts
                 let (po, _) = links.wait();
                 let mut buf = std::mem::take(&mut st.buf);
-                let data: &[u8] = if use_mmap { &ck_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ck_files[c.file], c) };
+                let data: &[u8] = if use_mmap && c.end + 64 <= ck_maps[c.file].len() { &ck_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ck_files[c.file], c) };
                 scan_lines(data, |f: &[&[u8]; 4]| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
@@ -1582,6 +1625,7 @@ fn main() {
             }
             let cap = (n + n / 2).next_power_of_two().max(64);
             let mask = cap - 1;
+            let t0 = std::time::Instant::now();
             table.clear();
             table.resize(cap, (u64::MAX, 0, 0));
             losers.clear();
@@ -1611,7 +1655,9 @@ fn main() {
                     }
                 }
             }
+            let t0 = prof(0, t0);
             losers.sort_unstable();
+            let t0 = prof(1, t0);
             // pass 2: sequential scan, skipping losers and invalid kept copies
             let mut li = 0usize;
             for (ti, s) in parsed_ref.iter().enumerate() {
@@ -1639,6 +1685,7 @@ fn main() {
                 v.person = person_of_ref.get(v.person).unwrap_or(v.person);
                 out.push((mix(v.person) >> (64 - pb_bits)) as usize, v);
             }
+            prof(2, t0);
         },
     );
     for st in &mut parsed {
@@ -1684,9 +1731,10 @@ fn main() {
             if n == 0 {
                 return;
             }
+            let t0 = std::time::Instant::now();
             let mut evs = std::mem::take(&mut st.evs);
             let mut cks = std::mem::take(&mut st.cks);
-            st.pt.reset(n / 8 + 64);
+            st.pt.reset(n / 4 + 64);
             st.pidx.clear();
             st.persons.clear();
             for (o, _, _, _) in dedup_ref.iter() {
@@ -1727,6 +1775,7 @@ fn main() {
                     evs[x..y].sort_unstable_by_key(|e| e.ts);
                 }
             }
+            let t0 = prof(3, t0);
             // clicks of the same people (clicks of people without events are dropped)
             st.cidx.clear();
             st.coff.clear();
@@ -1770,7 +1819,7 @@ fn main() {
                     cks[x..y].sort_unstable_by_key(|c| c.ts);
                 }
             }
-
+            let t0 = prof(4, t0);
             for q in 0..np {
                 let p = st.persons[q];
                 let (i, j) = (st.eoff[q] as usize, st.eoff[q + 1] as usize);
@@ -1868,6 +1917,7 @@ fn main() {
                 }
                 st.active.clear();
             }
+            prof(5, t0);
             st.evs = evs;
             st.cks = cks;
         },
@@ -1911,6 +1961,12 @@ fn main() {
         write_campaign(&cdd.join("part-000.parquet"), &rows, &camps, day0);
     });
     lap("write");
+    if std::env::var_os("X_PROF").is_some() {
+        let names = ["dedup pass1", "dedup sort", "dedup pass2", "sess group ev", "sess group ck", "sess walk"];
+        for (i, n) in names.iter().enumerate() {
+            eprintln!("{:>14}: {:7.1} ms cpu", n, PROF[i].load(Ordering::Relaxed) as f64 / 1e6);
+        }
+    }
     // PGO training runs must exit normally so the profile gets written.
     if std::env::var_os("X_PGO_TRAIN").is_some() {
         std::process::exit(0);
@@ -1992,12 +2048,18 @@ fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
             name[r] = k;
         }
     }
-    let mut person_of = U64Map::with_capacity(ids.len());
+    // Only IDs whose person is another ID are stored: a miss means "itself".
+    // Fewer entries keep the table small enough to stay mostly in cache.
+    let roots: Vec<usize> = (0..ids.len()).map(|i| find(&mut parent, i as u32) as usize).collect();
+    let moved = (0..ids.len()).filter(|&i| name[roots[i]] != ids[i]).count();
+    let mut person_of = U64Map::with_capacity(moved * 3 / 4 + 16);
     for i in 0..ids.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        person_of.insert(ids[i], name[r]);
+        let p = name[roots[i]];
+        if p != ids[i] {
+            person_of.insert(ids[i], p);
+        }
     }
-    eprintln!("links: {} pairs, {} ids", npairs, ids.len());
+    eprintln!("links: {} pairs, {} ids, {} stored, {} slots", npairs, ids.len(), moved, person_of.mask + 1);
     (person_of, reg)
 }
 
