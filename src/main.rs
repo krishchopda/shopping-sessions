@@ -827,83 +827,9 @@ fn main() {
     let organic = ncamp as u32;
     lap("small tables");
 
-    // ---- links
-    let link_maps = map_files(&list_csv(&data_dir.join("links")));
-    let link_chunks = chunks(&link_maps);
-    let link_parts = par_for(
-        nt,
-        link_chunks.len(),
-        || (Vec::<(u64, u64)>::new(), Reg::new()),
-        |(pairs, reg), i| {
-            let c = &link_chunks[i];
-            scan_lines(&link_maps[c.file][c.start..c.end], |f: &[&[u8]; 2]| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let a = key_of(f[0], reg);
-                let b = key_of(f[1], reg);
-                if a != b {
-                    pairs.push((a, b));
-                }
-            });
-        },
-    );
-    let mut reg: HashMap<u64, Vec<u8>> = HashMap::new();
-    let mut npairs = 0;
-    for (p, r) in &link_parts {
-        npairs += p.len();
-        for (k, b) in r {
-            reg.insert(*k, b.clone());
-        }
-    }
-    let mut idx = U64Map::with_capacity(npairs * 2 + 16);
-    let mut ids: Vec<u64> = Vec::with_capacity(npairs * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(npairs * 2);
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = p;
-        }
-        x
-    }
-    fn id_of(k: u64, idx: &mut U64Map, ids: &mut Vec<u64>, parent: &mut Vec<u32>) -> u32 {
-        if let Some(v) = idx.get(k) {
-            return v as u32;
-        }
-        let n = ids.len() as u32;
-        idx.insert(k, n as u64);
-        ids.push(k);
-        parent.push(n);
-        n
-    }
-    for (p, _) in &link_parts {
-        for &(a, b) in p {
-            let ia = id_of(a, &mut idx, &mut ids, &mut parent);
-            let ib = id_of(b, &mut idx, &mut ids, &mut parent);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                parent[ra.max(rb) as usize] = ra.min(rb);
-            }
-        }
-    }
-    drop(link_parts);
-    let mut name: Vec<u64> = vec![u64::MAX; ids.len()];
-    for i in 0..ids.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        let k = ids[i];
-        if name[r] == u64::MAX || key_less(k, name[r], &reg) {
-            name[r] = k;
-        }
-    }
-    let mut person_of = U64Map::with_capacity(ids.len());
-    for i in 0..ids.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        person_of.insert(ids[i], name[r]);
-    }
-    lap(&format!("links: {} pairs, {} ids", npairs, ids.len()));
-    drop((idx, parent, name, ids));
+    // ---- links run on their own thread, concurrently with event/click parsing
+    let link_dir = data_dir.join("links");
+    let link_handle = std::thread::spawn(move || build_links(&link_dir, 2));
 
     // ---- events + clicks
     let ev_maps = map_files(&list_csv(&data_dir.join("events")));
@@ -924,39 +850,14 @@ fn main() {
         evb: Buckets<Ev>,
         ckb: Buckets<Ck>,
         reg: Reg,
-        pend: Vec<(Ev, u64)>,
-        cpend: Vec<(Ck, u64)>,
     }
-    #[inline(always)]
-    fn flush_ev(st: &mut ParseSt, person_of: &U64Map) {
-        for i in 0..st.pend.len() {
-            let (mut e, uid) = st.pend[i];
-            e.person = person_of.get(uid).unwrap_or(uid);
-            let b = (mix(e.eid) >> (64 - EV_BITS)) as usize;
-            st.evb.push(b, e);
-        }
-        st.pend.clear();
-    }
-    #[inline(always)]
-    fn flush_ck(st: &mut ParseSt, person_of: &U64Map) {
-        for i in 0..st.cpend.len() {
-            let (mut c, uid) = st.cpend[i];
-            c.person = person_of.get(uid).unwrap_or(uid);
-            let b = (mix(c.person) >> (64 - PB_BITS)) as usize;
-            st.ckb.push(b, c);
-        }
-        st.cpend.clear();
-    }
-    let person_of_ref = &person_of;
     let mut parsed = par_for(
         nt,
         total_tasks,
         || ParseSt {
             evb: Buckets::new(n_evb, ev_res),
-            ckb: Buckets::new(n_pb, ck_res),
+            ckb: Buckets::new(1, ck_res * n_pb),
             reg: Reg::new(),
-            pend: Vec::with_capacity(BATCH),
-            cpend: Vec::with_capacity(BATCH),
         },
         |st, i| {
             if i < ev_chunks.len() {
@@ -996,17 +897,13 @@ fn main() {
                     if valid {
                         let uid = key_of(f[1], &mut st.reg);
                         let cat = if purchase { prod_lu.get(f[5]).map(|c| c as u16).unwrap_or(unknown_cat) } else { 0 };
-                        person_of_ref.prefetch(uid);
-                        st.pend.push((Ev { eid, person: 0, ts: (ts - ws) as u32, ingest, price, cat, flags }, uid));
-                        if st.pend.len() == BATCH {
-                            flush_ev(st, person_of_ref);
-                        }
+                        let b = (mix(eid) >> (64 - EV_BITS)) as usize;
+                        st.evb.push(b, Ev { eid, person: uid, ts: (ts - ws) as u32, ingest, price, cat, flags });
                     } else {
                         let b = (mix(eid) >> (64 - EV_BITS)) as usize;
                         st.evb.push(b, Ev { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, flags });
                     }
                 });
-                flush_ev(st, person_of_ref);
             } else {
                 let c = &ck_chunks[i - ev_chunks.len()];
                 scan_lines(&ck_maps[c.file][c.start..c.end], |f: &[&[u8]; 4]| {
@@ -1023,22 +920,62 @@ fn main() {
                     };
                     let cid = key_of(f[0], &mut st.reg);
                     let uid = key_of(f[1], &mut st.reg);
-                    person_of_ref.prefetch(uid);
-                    st.cpend.push((Ck { person: 0, ts, cid, camp }, uid));
-                    if st.cpend.len() == BATCH {
-                        flush_ck(st, person_of_ref);
-                    }
+                    st.ckb.push(0, Ck { person: uid, ts, cid, camp });
                 });
-                flush_ck(st, person_of_ref);
             }
         },
     );
+    lap("parse events+clicks");
+    let (person_of, mut reg) = link_handle.join().unwrap();
     for st in &mut parsed {
         for (k, b) in st.reg.drain(..) {
             reg.entry(k).or_insert(b);
         }
     }
-    lap("parse events+clicks");
+    lap("links joined");
+    let person_of_ref = &person_of;
+
+    // ---- clicks: resolve persons (prefetched batches) and partition by person
+    const CK_TASK: usize = 1 << 16;
+    let mut ck_tasks: Vec<(usize, usize)> = vec![];
+    for (ti, st) in parsed.iter().enumerate() {
+        let n = st.ckb.len(0);
+        let mut o = 0;
+        while o < n {
+            ck_tasks.push((ti, o));
+            o += CK_TASK;
+        }
+    }
+    let parsed_ref = &parsed;
+    let ck_parts = par_for(
+        nt,
+        ck_tasks.len(),
+        || Buckets::<Ck>::new(n_pb, ck_res * 2),
+        |out, t| {
+            let (ti, o) = ck_tasks[t];
+            let (m0, m1) = parsed_ref[ti].ckb.parts(0);
+            let n = m0.len() + m1.len();
+            let end = (o + CK_TASK).min(n);
+            let get = |i: usize| if i < m0.len() { m0[i] } else { m1[i - m0.len()] };
+            let mut i = o;
+            while i < end {
+                let e2 = (i + BATCH).min(end);
+                for k in i..e2 {
+                    person_of_ref.prefetch(get(k).person);
+                }
+                for k in i..e2 {
+                    let mut c = get(k);
+                    c.person = person_of_ref.get(c.person).unwrap_or(c.person);
+                    out.push((mix(c.person) >> (64 - PB_BITS)) as usize, c);
+                }
+                i = e2;
+            }
+        },
+    );
+    let mut parsed = parsed;
+    for st in &mut parsed {
+        st.ckb = Buckets::new(1, 1);
+    }
 
     // ---- dedup
     let parsed_ref = &parsed;
@@ -1046,8 +983,8 @@ fn main() {
     let dedup = par_for(
         nt,
         n_evb,
-        || (Buckets::<Sv>::new(n_pb, sv_res), Vec::<(u64, i32, u32)>::new(), Vec::<u32>::new()),
-        |(out, table, losers), b| {
+        || (Buckets::<Sv>::new(n_pb, sv_res), Vec::<(u64, i32, u32)>::new(), Vec::<u32>::new(), Vec::<Sv>::with_capacity(BATCH)),
+        |(out, table, losers, pend), b| {
             let n: usize = parsed_ref.iter().map(|s| s.evb.len(b)).sum();
             if n == 0 {
                 return;
@@ -1097,9 +1034,19 @@ fn main() {
                     if e.flags & 1 == 0 {
                         continue;
                     }
-                    let pb = (mix(e.person) >> (64 - PB_BITS)) as usize;
-                    out.push(pb, Sv { person: e.person, ts: ws + e.ts as i64, price: e.price, cat: e.cat, purchase: e.flags & 2 != 0 });
+                    person_of_ref.prefetch(e.person);
+                    pend.push(Sv { person: e.person, ts: ws + e.ts as i64, price: e.price, cat: e.cat, purchase: e.flags & 2 != 0 });
+                    if pend.len() == BATCH {
+                        for mut v in pend.drain(..) {
+                            v.person = person_of_ref.get(v.person).unwrap_or(v.person);
+                            out.push((mix(v.person) >> (64 - PB_BITS)) as usize, v);
+                        }
+                    }
                 }
+            }
+            for mut v in pend.drain(..) {
+                v.person = person_of_ref.get(v.person).unwrap_or(v.person);
+                out.push((mix(v.person) >> (64 - PB_BITS)) as usize, v);
             }
         },
     );
@@ -1110,6 +1057,7 @@ fn main() {
 
     // ---- sessions
     let dedup_ref = &dedup;
+    let ck_parts_ref = &ck_parts;
     let parsed_ref = &parsed;
     let reg_ref = &reg;
     let sess = par_for(
@@ -1129,7 +1077,7 @@ fn main() {
         |st, b| {
             let mut evs = std::mem::take(&mut st.evs);
             evs.clear();
-            for (o, _, _) in dedup_ref.iter() {
+            for (o, _, _, _) in dedup_ref.iter() {
                 let (m0, m1) = o.parts(b);
                 evs.extend_from_slice(m0);
                 evs.extend_from_slice(m1);
@@ -1141,8 +1089,8 @@ fn main() {
             evs.sort_unstable_by_key(|e| (e.person, e.ts));
             let mut cks = std::mem::take(&mut st.cks);
             cks.clear();
-            for s in parsed_ref {
-                let (m0, m1) = s.ckb.parts(b);
+            for s in ck_parts_ref {
+                let (m0, m1) = s.parts(b);
                 cks.extend_from_slice(m0);
                 cks.extend_from_slice(m1);
             }
@@ -1304,6 +1252,88 @@ fn main() {
     lap("write");
 }
 
+
+/// Parse links, union-find, and map every linked ID to its person name.
+fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
+    let link_maps = map_files(&list_csv(dir));
+    let link_chunks = chunks(&link_maps);
+    let link_parts = par_for(
+        nt,
+        link_chunks.len(),
+        || (Vec::<(u64, u64)>::new(), Reg::new()),
+        |(pairs, reg), i| {
+            let c = &link_chunks[i];
+            scan_lines(&link_maps[c.file][c.start..c.end], |f: &[&[u8]; 2]| {
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
+                }
+                let a = key_of(f[0], reg);
+                let b = key_of(f[1], reg);
+                if a != b {
+                    pairs.push((a, b));
+                }
+            });
+        },
+    );
+    let mut reg: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut npairs = 0;
+    for (p, r) in &link_parts {
+        npairs += p.len();
+        for (k, b) in r {
+            reg.insert(*k, b.clone());
+        }
+    }
+    let mut idx = U64Map::with_capacity(npairs * 2 + 16);
+    let mut ids: Vec<u64> = Vec::with_capacity(npairs * 2);
+    let mut parent: Vec<u32> = Vec::with_capacity(npairs * 2);
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            let p = parent[x as usize];
+            parent[x as usize] = parent[p as usize];
+            x = p;
+        }
+        x
+    }
+    fn id_of(k: u64, idx: &mut U64Map, ids: &mut Vec<u64>, parent: &mut Vec<u32>) -> u32 {
+        if let Some(v) = idx.get(k) {
+            return v as u32;
+        }
+        let n = ids.len() as u32;
+        idx.insert(k, n as u64);
+        ids.push(k);
+        parent.push(n);
+        n
+    }
+    for (p, _) in &link_parts {
+        for &(a, b) in p {
+            let ia = id_of(a, &mut idx, &mut ids, &mut parent);
+            let ib = id_of(b, &mut idx, &mut ids, &mut parent);
+            let ra = find(&mut parent, ia);
+            let rb = find(&mut parent, ib);
+            if ra != rb {
+                parent[ra.max(rb) as usize] = ra.min(rb);
+            }
+        }
+    }
+    drop(link_parts);
+    let mut name: Vec<u64> = vec![u64::MAX; ids.len()];
+    for i in 0..ids.len() {
+        let r = find(&mut parent, i as u32) as usize;
+        let k = ids[i];
+        if name[r] == u64::MAX || key_less(k, name[r], &reg) {
+            name[r] = k;
+        }
+    }
+    let mut person_of = U64Map::with_capacity(ids.len());
+    for i in 0..ids.len() {
+        let r = find(&mut parent, i as u32) as usize;
+        person_of.insert(ids[i], name[r]);
+    }
+    eprintln!("links: {} pairs, {} ids", npairs, ids.len());
+    (person_of, reg)
+}
+
+
 // ---------------------------------------------------------------- parquet
 
 use parquet::basic::Compression;
@@ -1337,7 +1367,26 @@ fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64
     while let Some(mut c) = rg.next_column().unwrap() {
         match col {
             0 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(bytes_of(r.person, reg))).collect();
+                let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 10);
+                let mut ends: Vec<usize> = Vec::with_capacity(rows.len());
+                for r in rows {
+                    if r.person & FALLBACK == 0 {
+                        unpack(r.person, &mut buf);
+                    } else {
+                        buf.extend_from_slice(&bytes_of(r.person, reg));
+                    }
+                    ends.push(buf.len());
+                }
+                let all = bytes::Bytes::from(buf);
+                let mut st = 0;
+                let v: Vec<ByteArray> = ends
+                    .iter()
+                    .map(|&e| {
+                        let x = ByteArray::from(all.slice(st..e));
+                        st = e;
+                        x
+                    })
+                    .collect();
                 c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
             }
             1 => {
