@@ -27,8 +27,8 @@ const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const FALLBACK: u64 = 1 << 63;
 const CHUNK: usize = 2 << 20;
-const EV_BITS: u32 = 11; // 2048 event buckets
-const PB_BITS: u32 = 10; // 1024 person buckets
+const EV_BITS: u32 = 8; // 256 event buckets
+const PB_BITS: u32 = 9; // 512 person buckets
 
 // ---------------------------------------------------------------- keys
 
@@ -195,6 +195,7 @@ fn dig2(b: &[u8]) -> Option<i64> {
     }
 }
 
+#[inline(always)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -373,22 +374,33 @@ impl Lookup {
     }
 }
 
-/// Open-addressing u64 -> u64 map, keys != u64::MAX.
+/// Open-addressing u64 -> u64 map, keys != u64::MAX; key and value share a cache line.
 struct U64Map {
     mask: usize,
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+    e: Vec<[u64; 2]>,
 }
 impl U64Map {
     fn with_capacity(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
-        U64Map { mask: cap - 1, keys: vec![u64::MAX; cap], vals: vec![0; cap] }
+        U64Map { mask: cap - 1, e: vec![[u64::MAX, 0]; cap] }
+    }
+    #[inline(always)]
+    fn start(&self, k: u64) -> usize {
+        (mix(k) >> 20) as usize & self.mask
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.e.as_ptr().add(self.start(k)) as *const i8, _MM_HINT_T0);
+        }
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
-        let mut i = (mix(k) >> 20) as usize & self.mask;
+        let mut i = self.start(k);
         loop {
-            let x = self.keys[i];
+            let x = self.e[i][0];
             if x == k || x == u64::MAX {
                 return i;
             }
@@ -397,14 +409,13 @@ impl U64Map {
     }
     fn insert(&mut self, k: u64, v: u64) {
         let i = self.slot(k);
-        self.keys[i] = k;
-        self.vals[i] = v;
+        self.e[i] = [k, v];
     }
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u64> {
         let i = self.slot(k);
-        if self.keys[i] == k {
-            Some(self.vals[i])
+        if self.e[i][0] == k {
+            Some(self.e[i][1])
         } else {
             None
         }
@@ -417,8 +428,8 @@ impl U64Map {
 struct Ev {
     eid: u64,
     person: u64,
-    ts: i64,
-    ingest: i64,
+    ts: u32,     // ms since window_start (valid events only)
+    ingest: i32, // whole seconds relative to window_start
     price: u32,
     cat: u16,
     flags: u8, // bit0 valid, bit1 purchase
@@ -538,6 +549,116 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     parse_ts(rest[..q].as_bytes()).expect("manifest ts")
 }
 
+/// Structural bitmasks (comma, quote, newline) for 64 bytes.
+#[inline(always)]
+fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let (cm, qm, nm) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8), _mm_set1_epi8(b'\n' as i8));
+        let mut c = 0u64;
+        let mut q = 0u64;
+        let mut n = 0u64;
+        for k in 0..4 {
+            let v = _mm_loadu_si128(p.as_ptr().add(k * 16) as *const __m128i);
+            c |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, cm)) as u32 as u64) << (k * 16);
+            q |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, qm)) as u32 as u64) << (k * 16);
+            n |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, nm)) as u32 as u64) << (k * 16);
+        }
+        (c, q, n)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let (mut c, mut q, mut n) = (0u64, 0u64, 0u64);
+        for (i, &b) in p.iter().enumerate() {
+            c |= ((b == b',') as u64) << i;
+            q |= ((b == b'"') as u64) << i;
+            n |= ((b == b'\n') as u64) << i;
+        }
+        (c, q, n)
+    }
+}
+
+/// Visit every well-formed line of `data` as exactly N unquoted fields.
+/// Only structural characters are touched; malformed lines are skipped.
+#[inline(always)]
+fn scan_lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = data.len();
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut nf = 0usize;
+    let mut bad = false;
+    let mut fstart = 0usize;
+    let mut nq = 0u32;
+    let mut qfirst = 0usize;
+    let mut qlast = 0usize;
+    let mut line_start = 0usize;
+
+    macro_rules! close_field {
+        ($pos:expr) => {{
+            let pos = $pos;
+            let v: &'a [u8] = if nq == 0 {
+                &data[fstart..pos]
+            } else if nq == 2 && qfirst == fstart && qlast + 1 == pos {
+                &data[fstart + 1..pos - 1]
+            } else {
+                bad = true;
+                &[]
+            };
+            if nf < N {
+                fields[nf] = v;
+            } else {
+                bad = true;
+            }
+            nf += 1;
+            nq = 0;
+            fstart = pos + 1;
+        }};
+    }
+
+    let mut base = 0usize;
+    let mut tail;
+    while base < len {
+        let (c, q, n) = if base + 64 <= len {
+            masks64(data[base..base + 64].try_into().unwrap())
+        } else {
+            tail = [0u8; 64];
+            tail[..len - base].copy_from_slice(&data[base..]);
+            masks64(&tail)
+        };
+        let mut m = c | q | n;
+        while m != 0 {
+            let i = m.trailing_zeros();
+            let bit = 1u64 << i;
+            m &= m - 1;
+            let pos = base + i as usize;
+            if q & bit != 0 {
+                if nq == 0 {
+                    qfirst = pos;
+                }
+                qlast = pos;
+                nq += 1;
+            } else {
+                close_field!(pos);
+                if n & bit != 0 {
+                    if !bad && nf == N && pos > line_start {
+                        f(&fields);
+                    }
+                    nf = 0;
+                    bad = false;
+                    line_start = pos + 1;
+                }
+            }
+        }
+        base += 64;
+    }
+    if line_start < len {
+        close_field!(len);
+        if !bad && nf == N {
+            f(&fields);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- parallel helper
 
 fn par_for<T: Send>(nthreads: usize, ntasks: usize, init: impl Fn() -> T + Sync, work: impl Fn(&mut T, usize) + Sync) -> Vec<T> {
@@ -648,9 +769,8 @@ fn main() {
         || (Vec::<(u64, u64)>::new(), Reg::new()),
         |(pairs, reg), i| {
             let c = &link_chunks[i];
-            for_lines(&link_maps[c.file][c.start..c.end], |line| {
-                let mut f: [&[u8]; 2] = [&[]; 2];
-                if !split(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+            scan_lines(&link_maps[c.file][c.start..c.end], |f: &[&[u8]; 2]| {
+                if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
                 let a = key_of(f[0], reg);
@@ -726,33 +846,63 @@ fn main() {
     let n_evb = 1usize << EV_BITS;
     let n_pb = 1usize << PB_BITS;
     let total_tasks = ev_chunks.len() + ck_chunks.len();
-    let resolve = |k: u64| person_of.get(k).unwrap_or(k);
 
+    const BATCH: usize = 32;
     struct ParseSt {
         evb: Vec<Vec<Ev>>,
         ckb: Vec<Vec<Ck>>,
         reg: Reg,
+        pend: Vec<(Ev, u64)>,
+        cpend: Vec<(Ck, u64)>,
     }
+    #[inline(always)]
+    fn flush_ev(st: &mut ParseSt, person_of: &U64Map) {
+        for i in 0..st.pend.len() {
+            let (mut e, uid) = st.pend[i];
+            e.person = person_of.get(uid).unwrap_or(uid);
+            let b = (mix(e.eid) >> (64 - EV_BITS)) as usize;
+            st.evb[b].push(e);
+        }
+        st.pend.clear();
+    }
+    #[inline(always)]
+    fn flush_ck(st: &mut ParseSt, person_of: &U64Map) {
+        for i in 0..st.cpend.len() {
+            let (mut c, uid) = st.cpend[i];
+            c.person = person_of.get(uid).unwrap_or(uid);
+            let b = (mix(c.person) >> (64 - PB_BITS)) as usize;
+            st.ckb[b].push(c);
+        }
+        st.cpend.clear();
+    }
+    let person_of_ref = &person_of;
     let mut parsed = par_for(
         nt,
         total_tasks,
-        || ParseSt { evb: (0..n_evb).map(|_| Vec::new()).collect(), ckb: (0..n_pb).map(|_| Vec::new()).collect(), reg: Reg::new() },
+        || ParseSt {
+            evb: (0..n_evb).map(|_| Vec::new()).collect(),
+            ckb: (0..n_pb).map(|_| Vec::new()).collect(),
+            reg: Reg::new(),
+            pend: Vec::with_capacity(BATCH),
+            cpend: Vec::with_capacity(BATCH),
+        },
         |st, i| {
             if i < ev_chunks.len() {
                 let c = &ev_chunks[i];
-                for_lines(&ev_maps[c.file][c.start..c.end], |line| {
-                    let mut f: [&[u8]; 7] = [&[]; 7];
-                    if !split(line, &mut f) || f[0].is_empty() {
+                let est = (c.end - c.start) / 70 / n_evb + 8;
+                scan_lines(&ev_maps[c.file][c.start..c.end], |f: &[&[u8]; 7]| {
+                    if f[0].is_empty() {
                         return;
                     }
                     let eid = key_of(f[0], &mut st.reg);
-                    let ingest = parse_ts(f[3]).unwrap_or(i64::MIN);
+                    let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MIN / 2);
+                    let ingest = (ingest_ms - ws).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                     let mut valid = !f[1].is_empty() && !f[5].is_empty();
                     let ts = match parse_ts(f[2]) {
                         Some(t) if t >= ws && t < we => t,
                         _ => {
                             valid = false;
-                            0
+                            ws
                         }
                     };
                     let mut purchase = false;
@@ -768,24 +918,32 @@ fn main() {
                         }
                         _ => valid = false,
                     }
-                    if valid && ingest.saturating_sub(ts) > DAY {
+                    if valid && ingest_ms - ts > DAY {
                         valid = false;
                     }
-                    let (person, cat) = if valid {
+                    let flags = valid as u8 | ((purchase as u8) << 1);
+                    if valid {
                         let uid = key_of(f[1], &mut st.reg);
                         let cat = if purchase { prod_lu.get(f[5]).map(|c| c as u16).unwrap_or(unknown_cat) } else { 0 };
-                        (resolve(uid), cat)
+                        person_of_ref.prefetch(uid);
+                        st.pend.push((Ev { eid, person: 0, ts: (ts - ws) as u32, ingest, price, cat, flags }, uid));
+                        if st.pend.len() == BATCH {
+                            flush_ev(st, person_of_ref);
+                        }
                     } else {
-                        (0, 0)
-                    };
-                    let b = (mix(eid) >> (64 - EV_BITS)) as usize;
-                    st.evb[b].push(Ev { eid, person, ts, ingest, price, cat, flags: valid as u8 | ((purchase as u8) << 1) });
+                        let b = (mix(eid) >> (64 - EV_BITS)) as usize;
+                        let v = &mut st.evb[b];
+                        if v.capacity() == 0 {
+                            v.reserve(est);
+                        }
+                        v.push(Ev { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, flags });
+                    }
                 });
+                flush_ev(st, person_of_ref);
             } else {
                 let c = &ck_chunks[i - ev_chunks.len()];
-                for_lines(&ck_maps[c.file][c.start..c.end], |line| {
-                    let mut f: [&[u8]; 4] = [&[]; 4];
-                    if !split(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+                scan_lines(&ck_maps[c.file][c.start..c.end], |f: &[&[u8]; 4]| {
+                    if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
                     let ts = match parse_ts(f[3]) {
@@ -797,10 +955,14 @@ fn main() {
                         None => return,
                     };
                     let cid = key_of(f[0], &mut st.reg);
-                    let person = resolve(key_of(f[1], &mut st.reg));
-                    let b = (mix(person) >> (64 - PB_BITS)) as usize;
-                    st.ckb[b].push(Ck { person, ts, cid, camp });
+                    let uid = key_of(f[1], &mut st.reg);
+                    person_of_ref.prefetch(uid);
+                    st.cpend.push((Ck { person: 0, ts, cid, camp }, uid));
+                    if st.cpend.len() == BATCH {
+                        flush_ck(st, person_of_ref);
+                    }
                 });
+                flush_ck(st, person_of_ref);
             }
         },
     );
@@ -858,7 +1020,7 @@ fn main() {
                     continue;
                 }
                 let pb = (mix(e.person) >> (64 - PB_BITS)) as usize;
-                out[pb].push(Sv { person: e.person, ts: e.ts, price: e.price, cat: e.cat, purchase: e.flags & 2 != 0 });
+                out[pb].push(Sv { person: e.person, ts: ws + e.ts as i64, price: e.price, cat: e.cat, purchase: e.flags & 2 != 0 });
             }
         },
     );
