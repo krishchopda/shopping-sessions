@@ -1465,7 +1465,7 @@ fn main() {
     // bench switches: X_MMAP reads chunks in place; X_STOP exits right after parsing
     // Read chunks straight from the page cache (no copy). The last chunk of a
     // file is copied into a padded buffer, since ID packing over-reads 16 bytes.
-    let use_mmap = std::env::var_os("X_PREAD").is_none();
+    let use_mmap = std::env::var_os("X_MMAP").is_some();
     let stop_after_parse = std::env::var("X_STOP").is_ok();
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
