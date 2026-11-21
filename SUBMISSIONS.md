@@ -29,3 +29,9 @@ noise between machines is up to ~20%, so compare with care.
 - Rows in the input are shuffled, so per-person "presorted run" tricks do not apply.
 - Every submission must pass: cargo test, 36 fixtures, dev answer, 10 reference
   seeds (`scripts/diff_seeds.sh`), and a 20M diff against a scored build.
+
+## Sat Nov 21 (late morning)
+- BB-FD15B5A2 — F+PGO @ 82847cb — **1.17 s** (ties best F)
+- BB-7DBB92F3 — F+static (crt-static, x86-64-v3) @ 03fd731 — **1.18 s** (neutral; within ±20% noise)
+- Board: rank ~111/273. Top: 0.30 / 0.31 / 0.31 / 0.42. Top entries decode generator-scrambled IDs to dense indices (authors opted out of reuse; rules forbid dataset-specific hard-coding) — not pursued.
+- Next: fuse post-dedup passes (group+sessions+attribution), batched field extraction, minimal Parquet writer.
