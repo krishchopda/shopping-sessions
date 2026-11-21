@@ -206,8 +206,65 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Memo of "YYYY-MM-DD" -> epoch ms for the dates around the window.
+/// Written once in main before any parsing threads start.
+static mut DATE_TAB: [(u64, u16, i64); 256] = [(0, 0, 0); 256];
+
+#[inline(always)]
+fn date_slot(s: &[u8]) -> usize {
+    ((((s[6] & 15) as usize) << 5) | ((((s[8] & 15) as usize) * 10 + (s[9] & 15) as usize) & 31)) & 255
+}
+
+fn fill_date_tab(from_day: i64, to_day: i64) {
+    for d in from_day..=to_day {
+        // civil_from_days
+        let z = d + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + (m <= 2) as i64;
+        if !(0..=9999).contains(&y) {
+            continue;
+        }
+        let txt = format!("{:04}-{:02}-{:02}", y, m, day);
+        let b = txt.as_bytes();
+        let k8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let k2 = u16::from_le_bytes(b[8..10].try_into().unwrap());
+        let i = date_slot(b);
+        unsafe {
+            if DATE_TAB[i].0 == 0 {
+                DATE_TAB[i] = (k8, k2, d * DAY);
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn civil(s: &[u8]) -> Option<i64> {
+    let k8 = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    let k2 = u16::from_le_bytes(s[8..10].try_into().unwrap());
+    let e = unsafe { *std::ptr::addr_of!(DATE_TAB).cast::<(u64, u16, i64)>().add(date_slot(s)) };
+    if e.0 == k8 && e.1 == k2 && e.0 != 0 {
+        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let h = dig2(&s[11..13])?;
+        let mi = dig2(&s[14..16])?;
+        let se = dig2(&s[17..19])?;
+        if h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        return Some(e.2 + (h * 3600 + mi * 60 + se) * 1000);
+    }
+    civil_slow(s)
+}
+
+#[cold]
+fn civil_slow(s: &[u8]) -> Option<i64> {
     if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
         return None;
     }
@@ -457,20 +514,52 @@ struct Ck {
 
 /// Fixed-capacity buckets carved from one anonymous mmap region advised as
 /// huge pages (one fault per 2 MiB instead of per 4 KiB), with a spill Vec per
-/// bucket for the rare overflow.
+/// bucket for the rare overflow. Pushes go through a small write-combining
+/// buffer per bucket (WC records, cache resident) that is flushed to the slab
+/// with non-temporal stores, so no slab line is ever read just to be written.
+const WC: usize = 8;
 struct Buckets<T: Copy> {
     ptr: *mut T,
     bytes: usize,
     cap: usize,
     lens: Vec<u32>,
     spill: Vec<Vec<T>>,
+    wc: Vec<T>,
+    wn: Vec<u8>,
 }
 unsafe impl<T: Copy + Send> Send for Buckets<T> {}
 unsafe impl<T: Copy + Sync> Sync for Buckets<T> {}
 
+#[inline(always)]
+unsafe fn stream_copy<T: Copy>(dst: *mut T, src: *const T, n: usize) {
+    let bytes = n * std::mem::size_of::<T>();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    {
+        use std::arch::x86_64::*;
+        if bytes % 32 == 0 && (dst as usize) % 32 == 0 {
+            let mut o = 0;
+            while o < bytes {
+                let v = _mm256_loadu_si256((src as *const u8).add(o) as *const __m256i);
+                _mm256_stream_si256((dst as *mut u8).add(o) as *mut __m256i, v);
+                o += 32;
+            }
+            return;
+        }
+    }
+    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
+}
+
+#[inline(always)]
+fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
 impl<T: Copy> Buckets<T> {
     fn new(nb: usize, cap: usize) -> Self {
-        let cap = cap.max(1);
+        let cap = (cap.max(1) + WC - 1) / WC * WC;
         let bytes = (nb * cap * std::mem::size_of::<T>()).max(4096);
         let ptr = unsafe {
             let p = libc::mmap(
@@ -485,17 +574,45 @@ impl<T: Copy> Buckets<T> {
             libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
             p as *mut T
         };
-        Buckets { ptr, bytes, cap, lens: vec![0; nb], spill: (0..nb).map(|_| Vec::new()).collect() }
+        let mut wc = Vec::with_capacity(nb * WC);
+        unsafe { wc.set_len(nb * WC) };
+        Buckets { ptr, bytes, cap, lens: vec![0; nb], spill: (0..nb).map(|_| Vec::new()).collect(), wc, wn: vec![0; nb] }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
-        let l = self.lens[b] as usize;
-        if l < self.cap {
-            unsafe { self.ptr.add(b * self.cap + l).write(x) };
-            self.lens[b] = l as u32 + 1;
+        let n = self.wn[b] as usize;
+        unsafe { *self.wc.get_unchecked_mut(b * WC + n) = x };
+        if n + 1 < WC {
+            self.wn[b] = n as u8 + 1;
         } else {
-            self.spill[b].push(x);
+            self.wn[b] = 0;
+            let l = self.lens[b] as usize;
+            if l + WC <= self.cap {
+                unsafe { stream_copy(self.ptr.add(b * self.cap + l), self.wc.as_ptr().add(b * WC), WC) };
+                self.lens[b] = (l + WC) as u32;
+            } else {
+                self.spill[b].extend_from_slice(&self.wc[b * WC..b * WC + WC]);
+            }
         }
+    }
+    /// Drain the write-combining buffers; call once the owner is done pushing.
+    fn finish(&mut self) {
+        for b in 0..self.lens.len() {
+            let n = self.wn[b] as usize;
+            if n == 0 {
+                continue;
+            }
+            self.wn[b] = 0;
+            let l = self.lens[b] as usize;
+            if self.spill[b].is_empty() && l + n <= self.cap {
+                unsafe { std::ptr::copy_nonoverlapping(self.wc.as_ptr().add(b * WC), self.ptr.add(b * self.cap + l), n) };
+                self.lens[b] = (l + n) as u32;
+            } else {
+                let tmp: Vec<T> = self.wc[b * WC..b * WC + n].to_vec();
+                self.spill[b].extend_from_slice(&tmp);
+            }
+        }
+        sfence();
     }
     #[inline(always)]
     fn main(&self, b: usize) -> &[T] {
@@ -503,9 +620,8 @@ impl<T: Copy> Buckets<T> {
     }
     #[inline(always)]
     fn len(&self, b: usize) -> usize {
-        self.lens[b] as usize + self.spill[b].len()
+        self.lens[b] as usize + self.spill[b].len() + self.wn[b] as usize
     }
-    /// Element i of bucket b (main part, then spill).
     #[inline(always)]
     fn parts(&self, b: usize) -> (&[T], &[T]) {
         (self.main(b), &self.spill[b])
@@ -617,7 +733,16 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 /// Structural bitmasks (comma, quote, newline) for 64 bytes.
 #[inline(always)]
 fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let (cm, qm, nm) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8));
+        let lo = _mm256_loadu_si256(p.as_ptr() as *const __m256i);
+        let hi = _mm256_loadu_si256(p.as_ptr().add(32) as *const __m256i);
+        let m = |v: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64;
+        return (m(lo, cm) | (m(hi, cm) << 32), m(lo, qm) | (m(hi, qm) << 32), m(lo, nm) | (m(hi, nm) << 32));
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     unsafe {
         use std::arch::x86_64::*;
         let (cm, qm, nm) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8), _mm_set1_epi8(b'\n' as i8));
@@ -739,6 +864,7 @@ fn par_for<T: Send>(nthreads: usize, ntasks: usize, init: impl Fn() -> T + Sync,
                             break;
                         }
                         work(&mut st, i);
+                        sfence();
                     }
                     st
                 })
@@ -805,6 +931,7 @@ fn main() {
     let we = manifest_ts(&manifest, "\"window_end\"");
     let cws = ws - WEEK;
     let day0 = ws.div_euclid(DAY);
+    fill_date_tab(day0 - 10, (we - 1).div_euclid(DAY) + 7);
     let nd = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
 
     let prods = read_small(&data_dir.join("products.csv"));
@@ -842,7 +969,7 @@ fn main() {
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
     // generous per-thread reservations: untouched capacity costs no page faults
-    let ev_res = ev_bytes / 60 / nt / n_evb * 3 / 2 + 64;
+    let ev_res = ev_bytes / 62 / nt / n_evb * 5 / 4 + 64;
     let ck_res = ck_bytes / 45 / nt / n_pb * 3 / 2 + 64;
 
     const BATCH: usize = 32;
@@ -925,6 +1052,10 @@ fn main() {
             }
         },
     );
+    for st in &mut parsed {
+        st.evb.finish();
+        st.ckb.finish();
+    }
     lap("parse events+clicks");
     let (person_of, mut reg) = link_handle.join().unwrap();
     for st in &mut parsed {
@@ -972,6 +1103,10 @@ fn main() {
             }
         },
     );
+    let mut ck_parts = ck_parts;
+    for c in &mut ck_parts {
+        c.finish();
+    }
     let mut parsed = parsed;
     for st in &mut parsed {
         st.ckb = Buckets::new(1, 1);
@@ -979,7 +1114,7 @@ fn main() {
 
     // ---- dedup
     let parsed_ref = &parsed;
-    let sv_res = ev_bytes / 60 / nt / n_pb * 3 / 2 + 64;
+    let sv_res = ev_bytes / 62 / nt / n_pb * 5 / 4 + 64;
     let dedup = par_for(
         nt,
         n_evb,
@@ -1052,6 +1187,10 @@ fn main() {
     );
     for st in &mut parsed {
         st.evb = Buckets::new(1, 1);
+    }
+    let mut dedup = dedup;
+    for d in &mut dedup {
+        d.0.finish();
     }
     lap("dedup");
 
@@ -1250,6 +1389,8 @@ fn main() {
         write_campaign(&cdd.join("part-000.parquet"), &rows, &camps, day0);
     });
     lap("write");
+    // Skip destructors and allocator teardown: the kernel reclaims everything.
+    unsafe { libc::_exit(0) };
 }
 
 
