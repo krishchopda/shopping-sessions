@@ -1233,8 +1233,10 @@ fn main() {
     // (dedup table, person grouping) stays around L2 size: ~40k events each.
     let est_events = ev_bytes / 62 + 1;
     let bits_for = |n: usize| -> u32 { (usize::BITS - (n / 40_000).leading_zeros()).clamp(8, 11) };
-    let ev_bits: u32 = bits_for(est_events);
-    let pb_bits: u32 = bits_for(est_events);
+    // X_BITS forces a partition width (tests the 60M-scale code path on small data)
+    let forced: Option<u32> = std::env::var("X_BITS").ok().and_then(|v| v.parse().ok());
+    let ev_bits: u32 = forced.unwrap_or_else(|| bits_for(est_events));
+    let pb_bits: u32 = forced.unwrap_or_else(|| bits_for(est_events));
     let n_evb = 1usize << ev_bits;
     let n_pb = 1usize << pb_bits;
     // generous per-thread reservations: untouched capacity costs no page faults
