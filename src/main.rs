@@ -14,6 +14,7 @@
 //! is 1..=12 chars of [0-9a-z] (base 37, 0 = padding). Anything else gets a
 //! FALLBACK-flagged hash key and its bytes are kept in a side registry.
 
+mod pq;
 use memchr::memchr;
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -1926,6 +1927,7 @@ fn main() {
     lap("sessions");
 
     // ---- output
+    let crate_pq = std::env::var_os("X_PQCRATE").is_some();
     let ud = out_dir.join("user_daily");
     let cdd = out_dir.join("campaign_daily");
     fs::create_dir_all(&ud).unwrap();
@@ -1939,7 +1941,7 @@ fn main() {
             let path = ud.join(format!("part-{t:03}.parquet"));
             let cat_names = &cat_names;
             let reg = &reg;
-            sc.spawn(move || write_user(&path, &st.rows, cat_names, reg));
+            sc.spawn(move || if crate_pq { write_user(&path, &st.rows, cat_names, reg) } else { write_user_fast(&path, &st.rows, cat_names, reg) });
         }
         let mut agg = vec![[0i64; 4]; (ncamp + 1) * nd];
         for st in &sess {
@@ -1958,7 +1960,7 @@ fn main() {
                 }
             }
         }
-        write_campaign(&cdd.join("part-000.parquet"), &rows, &camps, day0);
+        if crate_pq { write_campaign(&cdd.join("part-000.parquet"), &rows, &camps, day0) } else { write_campaign_fast(&cdd.join("part-000.parquet"), &rows, &camps, day0) }
     });
     lap("write");
     if std::env::var_os("X_PROF").is_some() {
@@ -2145,6 +2147,66 @@ fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64
     }
     rg.close().unwrap();
     w.close().unwrap();
+}
+
+fn write_user_fast(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64, Vec<u8>>) {
+    let n = rows.len();
+    let mut ub: Vec<u8> = Vec::with_capacity(n * 10);
+    let mut ue: Vec<u32> = Vec::with_capacity(n);
+    for r in rows {
+        if r.person & FALLBACK == 0 {
+            unpack(r.person, &mut ub);
+        } else {
+            ub.extend_from_slice(&bytes_of(r.person, reg));
+        }
+        ue.push(ub.len() as u32);
+    }
+    let mut cb: Vec<u8> = Vec::new();
+    let mut ce: Vec<u32> = Vec::new();
+    let mut defs: Vec<bool> = Vec::with_capacity(n);
+    for r in rows {
+        defs.push(r.top >= 0);
+        if r.top >= 0 {
+            cb.extend_from_slice(&cats[r.top as usize]);
+            ce.push(cb.len() as u32);
+        }
+    }
+    let cols = [
+        pq::Col::Str { name: "user_id", bytes: ub, ends: ue, defs: None },
+        pq::Col::I32 { name: "day", date: true, v: rows.iter().map(|r| r.day).collect() },
+        pq::Col::I32 { name: "sessions", date: false, v: rows.iter().map(|r| r.sessions as i32).collect() },
+        pq::Col::I32 { name: "events", date: false, v: rows.iter().map(|r| r.events as i32).collect() },
+        pq::Col::I64 { name: "revenue_cents", v: rows.iter().map(|r| r.revenue).collect() },
+        pq::Col::Str { name: "top_category", bytes: cb, ends: ce, defs: Some(defs) },
+    ];
+    pq::write(path, n, &cols).unwrap();
+}
+
+fn write_campaign_fast(path: &Path, rows: &[(usize, usize, [i64; 4])], camps: &[(Vec<u8>, Vec<u8>)], day0: i64) {
+    let ncamp = camps.len();
+    let (mut ib, mut ie, mut chb, mut che) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (ci, _, _) in rows {
+        if *ci == ncamp {
+            ib.extend_from_slice(b"organic");
+            chb.extend_from_slice(b"organic");
+        } else {
+            ib.extend_from_slice(&camps[*ci].0);
+            chb.extend_from_slice(&camps[*ci].1);
+        }
+        ie.push(ib.len() as u32);
+        che.push(chb.len() as u32);
+    }
+    let q = |k: usize| rows.iter().map(|(_, _, r)| r[k]).collect::<Vec<i64>>();
+    let cols = [
+        pq::Col::Str { name: "campaign_id", bytes: ib, ends: ie, defs: None },
+        pq::Col::Str { name: "channel", bytes: chb, ends: che, defs: None },
+        pq::Col::I32 { name: "day", date: true, v: rows.iter().map(|(_, d, _)| (day0 + *d as i64) as i32).collect() },
+        pq::Col::I64 { name: "sessions", v: q(0) },
+        pq::Col::I64 { name: "purchasing_sessions", v: q(1) },
+        pq::Col::I64 { name: "revenue_cents", v: q(2) },
+        pq::Col::I64 { name: "assisted_sessions", v: q(3) },
+    ];
+    pq::write(path, rows.len(), &cols).unwrap();
 }
 
 fn write_campaign(path: &Path, rows: &[(usize, usize, [i64; 4])], camps: &[(Vec<u8>, Vec<u8>)], day0: i64) {
