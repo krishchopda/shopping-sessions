@@ -1820,7 +1820,7 @@ fn props() -> Arc<WriterProperties> {
 fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64, Vec<u8>>) {
     let schema = Arc::new(
         parse_message_type(
-            "message user_daily { REQUIRED BYTE_ARRAY user_id (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; OPTIONAL BYTE_ARRAY top_category (UTF8); }",
+            "message user_daily { REQUIRED BYTE_ARRAY user_id (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT32 sessions; REQUIRED INT32 events; REQUIRED INT64 revenue_cents; OPTIONAL BYTE_ARRAY top_category (UTF8); }",
         )
         .unwrap(),
     );
@@ -1858,15 +1858,12 @@ fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64
                 let v: Vec<i32> = rows.iter().map(|r| r.day).collect();
                 c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
             }
-            2 | 3 | 4 => {
-                let v: Vec<i64> = rows
-                    .iter()
-                    .map(|r| match col {
-                        2 => r.sessions,
-                        3 => r.events,
-                        _ => r.revenue,
-                    })
-                    .collect();
+            2 | 3 => {
+                let v: Vec<i32> = rows.iter().map(|r| if col == 2 { r.sessions as i32 } else { r.events as i32 }).collect();
+                c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
+            }
+            4 => {
+                let v: Vec<i64> = rows.iter().map(|r| r.revenue).collect();
                 c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
             }
             _ => {
