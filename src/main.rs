@@ -65,6 +65,55 @@ fn pack(s: &[u8]) -> Option<u64> {
     Some(v << (6 * (10 - n)))
 }
 
+/// Same encoding as `pack`, for a field that has at least 16 readable bytes
+/// from its start (the pread buffer is padded). SIMD rank + BMI2 pext.
+#[inline(always)]
+fn pack_padded(s: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let n = s.len();
+        if n == 0 || n > 10 {
+            return None;
+        }
+        let raw = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+        // zero the bytes past the field
+        let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let keep = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx);
+        let v = _mm_and_si128(raw, keep);
+        // ranks: '0'..'9' -> 1..10, 'a'..'z' -> 11..36, anything else -> 0
+        let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let is_d = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+        let a = _mm_sub_epi8(v, _mm_set1_epi8(b'a' as i8));
+        let is_a = _mm_cmpeq_epi8(_mm_min_epu8(a, _mm_set1_epi8(25)), a);
+        let rank = _mm_or_si128(
+            _mm_and_si128(is_d, _mm_add_epi8(d, _mm_set1_epi8(1))),
+            _mm_and_si128(is_a, _mm_add_epi8(a, _mm_set1_epi8(11))),
+        );
+        let ok = (_mm_movemask_epi8(_mm_or_si128(is_d, is_a)) as u32) & ((1u32 << n) - 1);
+        if ok != (1u32 << n) - 1 {
+            return None;
+        }
+        // big-endian char order, then 6 bits per char
+        let rev = _mm_shuffle_epi8(rank, _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0));
+        let hi = _mm_extract_epi64(rev, 1) as u64; // chars 0..7
+        let lo = _mm_extract_epi64(rev, 0) as u64; // chars 8..15
+        let a8 = _pext_u64(hi, 0x3f3f_3f3f_3f3f_3f3f);
+        let b2 = _pext_u64(lo, 0x3f3f_0000_0000_0000);
+        return Some((a8 << 12) | b2);
+    }
+    #[allow(unreachable_code)]
+    pack(s)
+}
+
+#[inline(always)]
+fn key_of_padded(s: &[u8], reg: &mut Reg) -> u64 {
+    match pack_padded(s) {
+        Some(k) => k,
+        None => key_of(s, reg),
+    }
+}
+
 fn unpack(v: u64, out: &mut Vec<u8>) {
     for i in (0..10).rev() {
         let r = ((v >> (6 * i)) & 63) as u8;
@@ -708,8 +757,8 @@ fn open_files(paths: &[PathBuf]) -> Vec<File> {
 fn read_chunk<'a>(buf: &'a mut Vec<u8>, f: &File, c: &Chunk) -> &'a [u8] {
     use std::os::unix::fs::FileExt;
     let n = c.end - c.start;
-    if buf.len() < n {
-        buf.resize(n, 0);
+    if buf.len() < n + 64 {
+        buf.resize(n + 64, 0);
     }
     f.read_exact_at(&mut buf[..n], c.start as u64).expect("pread");
     &buf[..n]
@@ -818,9 +867,96 @@ fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
 }
 
 /// Visit every well-formed line of `data` as exactly N unquoted fields.
-/// Only structural characters are touched; malformed lines are skipped.
+/// Only commas and newlines are visited; a field's quotes are counted with
+/// popcnt on the quote bitmask and its wrapping is decided without branches.
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = data.len();
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut nf = 0usize;
+    let mut bad = false;
+    let mut fstart = 0usize;
+    let mut line_start = 0usize;
+    let mut prev_q = 0u64;
+    let mut prev_base = 0usize;
+
+    #[inline(always)]
+    fn quotes_slow(d: &[u8]) -> u32 {
+        d.iter().filter(|&&c| c == b'"').count() as u32
+    }
+
+    let mut base = 0usize;
+    let mut tail;
+    while base < len {
+        let (c, q, n) = if base + 64 <= len {
+            masks64(data[base..base + 64].try_into().unwrap())
+        } else {
+            tail = [0u8; 64];
+            tail[..len - base].copy_from_slice(&data[base..]);
+            masks64(&tail)
+        };
+        let mut m = c | n;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let pos = base + i;
+            let below = (1u64 << i) - 1;
+            let qc = if fstart >= base {
+                (q & below & !((1u64 << (fstart - base)) - 1)).count_ones()
+            } else if fstart >= prev_base {
+                (prev_q >> (fstart - prev_base)).count_ones() + (q & below).count_ones()
+            } else {
+                quotes_slow(&data[fstart..pos])
+            };
+            let flen = pos - fstart;
+            let wrapped = qc == 2 && flen >= 2 && data[fstart] == b'"' && data[pos - 1] == b'"';
+            bad |= qc != 0 && !wrapped;
+            let w = wrapped as usize;
+            let v: &'a [u8] = unsafe { data.get_unchecked(fstart + w..pos - w) };
+            if nf < N {
+                fields[nf] = v;
+            } else {
+                bad = true;
+            }
+            nf += 1;
+            fstart = pos + 1;
+            if n >> i & 1 != 0 {
+                if !bad && nf == N && pos > line_start {
+                    f(&fields);
+                }
+                nf = 0;
+                bad = false;
+                line_start = pos + 1;
+            }
+        }
+        prev_q = q;
+        prev_base = base;
+        base += 64;
+    }
+    if line_start < len {
+        let pos = len;
+        let qc = quotes_slow(&data[fstart..pos]);
+        let flen = pos - fstart;
+        let wrapped = qc == 2 && flen >= 2 && data[fstart] == b'"' && data[pos - 1] == b'"';
+        bad |= qc != 0 && !wrapped;
+        let w = wrapped as usize;
+        if nf < N {
+            fields[nf] = &data[fstart + w..pos - w];
+        } else {
+            bad = true;
+        }
+        nf += 1;
+        if !bad && nf == N {
+            f(&fields);
+        }
+    }
+}
+
+/// Visit every well-formed line of `data` as exactly N unquoted fields.
+/// Only structural characters are touched; malformed lines are skipped.
+#[inline(always)]
+#[allow(dead_code)]
+fn scan_lines_ref<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = data.len();
     let mut fields: [&'a [u8]; N] = [&[]; N];
     let mut nf = 0usize;
@@ -1082,7 +1218,6 @@ fn main() {
     let ck_chunks = chunks(&ck_maps);
     let ev_files = open_files(&list_csv(&data_dir.join("events")));
     let ck_files = open_files(&list_csv(&data_dir.join("clicks")));
-    let use_mmap = std::env::var("X_MMAP").is_ok();
     let n_evb = 1usize << EV_BITS;
     let n_pb = 1usize << PB_BITS;
     let total_tasks = ev_chunks.len() + ck_chunks.len();
@@ -1113,12 +1248,12 @@ fn main() {
             if i < ev_chunks.len() {
                 let c = &ev_chunks[i];
                 let mut buf = std::mem::take(&mut st.buf);
-                let data: &[u8] = if use_mmap { &ev_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ev_files[c.file], c) };
+                let data: &[u8] = read_chunk(&mut buf, &ev_files[c.file], c);
                 scan_lines(data, |f: &[&[u8]; 7]| {
                     if f[0].is_empty() {
                         return;
                     }
-                    let eid = key_of(f[0], &mut st.reg);
+                    let eid = key_of_padded(f[0], &mut st.reg);
                     let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MIN / 2);
                     let ingest = (ingest_ms - ws).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                     let mut valid = !f[1].is_empty() && !f[5].is_empty();
@@ -1147,7 +1282,7 @@ fn main() {
                     }
                     let flags = valid as u8 | ((purchase as u8) << 1);
                     if valid {
-                        let uid = key_of(f[1], &mut st.reg);
+                        let uid = key_of_padded(f[1], &mut st.reg);
                         let cat = if purchase { prod_lu.get(f[5]).map(|c| c as u16).unwrap_or(unknown_cat) } else { 0 };
                         let b = (mix(eid) >> (64 - EV_BITS)) as usize;
                         st.evb.push(b, Ev { eid, person: uid, ts: (ts - ws) as u32, ingest, price, cat, flags });
@@ -1160,7 +1295,7 @@ fn main() {
             } else {
                 let c = &ck_chunks[i - ev_chunks.len()];
                 let mut buf = std::mem::take(&mut st.buf);
-                let data: &[u8] = if use_mmap { &ck_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ck_files[c.file], c) };
+                let data: &[u8] = read_chunk(&mut buf, &ck_files[c.file], c);
                 scan_lines(data, |f: &[&[u8]; 4]| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
@@ -1173,8 +1308,8 @@ fn main() {
                         Some(c) => c,
                         None => return,
                     };
-                    let cid = key_of(f[0], &mut st.reg);
-                    let uid = key_of(f[1], &mut st.reg);
+                    let cid = key_of_padded(f[0], &mut st.reg);
+                    let uid = key_of_padded(f[1], &mut st.reg);
                     st.ckb.push(0, Ck { person: uid, ts, cid, camp });
                 });
                 st.buf = buf;
@@ -1805,4 +1940,60 @@ fn write_campaign(path: &Path, rows: &[(usize, usize, [i64; 4])], camps: &[(Vec<
     }
     rg.close().unwrap();
     w.close().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn collect<const N: usize>(d: &[u8], fast: bool) -> Vec<Vec<Vec<u8>>> {
+        let mut out = vec![];
+        if fast {
+            scan_lines::<N>(d, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        } else {
+            scan_lines_ref::<N>(d, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        }
+        out
+    }
+    #[test]
+    fn scanner_matches_reference() {
+        let pieces: [&[u8]; 14] = [b"ab", b"\"x\"", b"\"\"", b"\"", b"", b"long_field_value_that_goes_on_and_on_and_on_and_on_xx", b"\r", b" a ", b"\"a\"b\"", b"1234567890", b"\"q", b"q\"", b"z", b"\"\"\""];
+        let mut x: u64 = 99;
+        let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for _ in 0..3000 {
+            let mut d = vec![];
+            let lines = rnd() % 40;
+            for _ in 0..lines {
+                let nf = 1 + rnd() % 5;
+                for k in 0..nf {
+                    if k > 0 { d.push(b','); }
+                    d.extend_from_slice(pieces[(rnd() % 14) as usize]);
+                }
+                if rnd() % 50 != 0 { d.push(b'\n'); } else { d.extend_from_slice(b"\n\n"); }
+            }
+            if rnd() % 3 == 0 { d.pop(); }
+            assert_eq!(collect::<2>(&d, true), collect::<2>(&d, false));
+            assert_eq!(collect::<3>(&d, true), collect::<3>(&d, false));
+            assert_eq!(collect::<4>(&d, true), collect::<4>(&d, false));
+        }
+    }
+    #[test]
+    fn pack_padded_matches_pack() {
+        let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyzAZ _\"\r,-";
+        let mut x: u64 = 12345;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 13) as usize;
+            let mut buf = [b'q'; 32];
+            for i in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let pool = if x % 10 == 0 { &alphabet[..] } else { &alphabet[..36] };
+                buf[i] = pool[(x >> 8) as usize % pool.len()];
+            }
+            assert_eq!(pack_padded(&buf[..n]), pack(&buf[..n]), "{:?}", &buf[..n]);
+        }
+    }
 }
