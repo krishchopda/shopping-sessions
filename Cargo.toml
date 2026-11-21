@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 memchr = "2"
 memmap2 = "0.9"
+libc = "0.2"
 parquet = { version = "53", default-features = false }
 
 [profile.release]

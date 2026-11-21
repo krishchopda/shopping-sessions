@@ -32,41 +32,42 @@ const PB_BITS: u32 = 9; // 512 person buckets
 
 // ---------------------------------------------------------------- keys
 
-#[inline(always)]
-fn rank(c: u8) -> u64 {
-    match c {
-        b'0'..=b'9' => (c - b'0' + 1) as u64,
-        b'a'..=b'z' => (c - b'a' + 11) as u64,
-        _ => 0,
+const RANK: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut c = 0;
+    while c < 10 {
+        t[b'0' as usize + c] = 1 + c as u8;
+        c += 1;
     }
-}
+    let mut c = 0;
+    while c < 26 {
+        t[b'a' as usize + c] = 11 + c as u8;
+        c += 1;
+    }
+    t
+};
 
+/// 1..=10 chars of [0-9a-z] -> 6 bits per char, zero padded: integer order == byte order.
 #[inline(always)]
 fn pack(s: &[u8]) -> Option<u64> {
-    if s.is_empty() || s.len() > 12 {
+    let n = s.len();
+    if n == 0 || n > 10 {
         return None;
     }
     let mut v = 0u64;
     for &c in s {
-        let r = rank(c);
+        let r = RANK[c as usize];
         if r == 0 {
             return None;
         }
-        v = v * 37 + r;
+        v = (v << 6) | r as u64;
     }
-    for _ in s.len()..12 {
-        v *= 37;
-    }
-    Some(v)
+    Some(v << (6 * (10 - n)))
 }
 
-fn unpack(mut v: u64, out: &mut Vec<u8>) {
-    let mut buf = [0u8; 12];
-    for i in (0..12).rev() {
-        buf[i] = (v % 37) as u8;
-        v /= 37;
-    }
-    for &r in &buf {
+fn unpack(v: u64, out: &mut Vec<u8>) {
+    for i in (0..10).rev() {
+        let r = ((v >> (6 * i)) & 63) as u8;
         if r == 0 {
             break;
         }
@@ -452,6 +453,70 @@ struct Ck {
     camp: u32,
 }
 
+// ---------------------------------------------------------------- huge-page slabs
+
+/// Fixed-capacity buckets carved from one anonymous mmap region advised as
+/// huge pages (one fault per 2 MiB instead of per 4 KiB), with a spill Vec per
+/// bucket for the rare overflow.
+struct Buckets<T: Copy> {
+    ptr: *mut T,
+    bytes: usize,
+    cap: usize,
+    lens: Vec<u32>,
+    spill: Vec<Vec<T>>,
+}
+unsafe impl<T: Copy + Send> Send for Buckets<T> {}
+unsafe impl<T: Copy + Sync> Sync for Buckets<T> {}
+
+impl<T: Copy> Buckets<T> {
+    fn new(nb: usize, cap: usize) -> Self {
+        let cap = cap.max(1);
+        let bytes = (nb * cap * std::mem::size_of::<T>()).max(4096);
+        let ptr = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "mmap slab");
+            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+            p as *mut T
+        };
+        Buckets { ptr, bytes, cap, lens: vec![0; nb], spill: (0..nb).map(|_| Vec::new()).collect() }
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, x: T) {
+        let l = self.lens[b] as usize;
+        if l < self.cap {
+            unsafe { self.ptr.add(b * self.cap + l).write(x) };
+            self.lens[b] = l as u32 + 1;
+        } else {
+            self.spill[b].push(x);
+        }
+    }
+    #[inline(always)]
+    fn main(&self, b: usize) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr.add(b * self.cap), self.lens[b] as usize) }
+    }
+    #[inline(always)]
+    fn len(&self, b: usize) -> usize {
+        self.lens[b] as usize + self.spill[b].len()
+    }
+    /// Element i of bucket b (main part, then spill).
+    #[inline(always)]
+    fn parts(&self, b: usize) -> (&[T], &[T]) {
+        (self.main(b), &self.spill[b])
+    }
+}
+impl<T: Copy> Drop for Buckets<T> {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.bytes) };
+    }
+}
+
 // ---------------------------------------------------------------- files
 
 struct Chunk {
@@ -702,6 +767,8 @@ struct SessSt {
     active: Vec<u32>,
     catsum: Vec<i64>,
     touched: Vec<u16>,
+    evs: Vec<Sv>,
+    cks: Vec<Ck>,
 }
 
 fn flush_day(st: &mut SessSt, person: u64, day: i64, s: i64, ev: i64, rv: i64) {
@@ -846,11 +913,16 @@ fn main() {
     let n_evb = 1usize << EV_BITS;
     let n_pb = 1usize << PB_BITS;
     let total_tasks = ev_chunks.len() + ck_chunks.len();
+    let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
+    let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
+    // generous per-thread reservations: untouched capacity costs no page faults
+    let ev_res = ev_bytes / 60 / nt / n_evb * 3 / 2 + 64;
+    let ck_res = ck_bytes / 45 / nt / n_pb * 3 / 2 + 64;
 
     const BATCH: usize = 32;
     struct ParseSt {
-        evb: Vec<Vec<Ev>>,
-        ckb: Vec<Vec<Ck>>,
+        evb: Buckets<Ev>,
+        ckb: Buckets<Ck>,
         reg: Reg,
         pend: Vec<(Ev, u64)>,
         cpend: Vec<(Ck, u64)>,
@@ -861,7 +933,7 @@ fn main() {
             let (mut e, uid) = st.pend[i];
             e.person = person_of.get(uid).unwrap_or(uid);
             let b = (mix(e.eid) >> (64 - EV_BITS)) as usize;
-            st.evb[b].push(e);
+            st.evb.push(b, e);
         }
         st.pend.clear();
     }
@@ -871,7 +943,7 @@ fn main() {
             let (mut c, uid) = st.cpend[i];
             c.person = person_of.get(uid).unwrap_or(uid);
             let b = (mix(c.person) >> (64 - PB_BITS)) as usize;
-            st.ckb[b].push(c);
+            st.ckb.push(b, c);
         }
         st.cpend.clear();
     }
@@ -880,8 +952,8 @@ fn main() {
         nt,
         total_tasks,
         || ParseSt {
-            evb: (0..n_evb).map(|_| Vec::new()).collect(),
-            ckb: (0..n_pb).map(|_| Vec::new()).collect(),
+            evb: Buckets::new(n_evb, ev_res),
+            ckb: Buckets::new(n_pb, ck_res),
             reg: Reg::new(),
             pend: Vec::with_capacity(BATCH),
             cpend: Vec::with_capacity(BATCH),
@@ -889,7 +961,6 @@ fn main() {
         |st, i| {
             if i < ev_chunks.len() {
                 let c = &ev_chunks[i];
-                let est = (c.end - c.start) / 70 / n_evb + 8;
                 scan_lines(&ev_maps[c.file][c.start..c.end], |f: &[&[u8]; 7]| {
                     if f[0].is_empty() {
                         return;
@@ -932,11 +1003,7 @@ fn main() {
                         }
                     } else {
                         let b = (mix(eid) >> (64 - EV_BITS)) as usize;
-                        let v = &mut st.evb[b];
-                        if v.capacity() == 0 {
-                            v.reserve(est);
-                        }
-                        v.push(Ev { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, flags });
+                        st.evb.push(b, Ev { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, flags });
                     }
                 });
                 flush_ev(st, person_of_ref);
@@ -975,57 +1042,69 @@ fn main() {
 
     // ---- dedup
     let parsed_ref = &parsed;
+    let sv_res = ev_bytes / 60 / nt / n_pb * 3 / 2 + 64;
     let dedup = par_for(
         nt,
         n_evb,
-        || ((0..n_pb).map(|_| Vec::<Sv>::new()).collect::<Vec<_>>(), Vec::<u32>::new(), Vec::<Ev>::new()),
-        |(out, table, all), b| {
-            all.clear();
-            for s in parsed_ref {
-                all.extend_from_slice(&s.evb[b]);
-            }
-            let n = all.len();
+        || (Buckets::<Sv>::new(n_pb, sv_res), Vec::<(u64, i32, u32)>::new(), Vec::<u32>::new()),
+        |(out, table, losers), b| {
+            let n: usize = parsed_ref.iter().map(|s| s.evb.len(b)).sum();
             if n == 0 {
                 return;
             }
             let cap = (n * 2).next_power_of_two();
             let mask = cap - 1;
             table.clear();
-            table.resize(cap, u32::MAX);
-            for i in 0..n {
-                let e = &all[i];
-                let mut h = (mix(e.eid) >> 8) as usize & mask;
-                loop {
-                    let t = table[h];
-                    if t == u32::MAX {
-                        table[h] = i as u32;
-                        break;
-                    }
-                    let o = &all[t as usize];
-                    if o.eid == e.eid {
-                        if e.ingest < o.ingest {
-                            table[h] = i as u32;
+            table.resize(cap, (u64::MAX, 0, 0));
+            losers.clear();
+            // pass 1: (eid -> min ingest, winner id); record every loser id
+            for (ti, s) in parsed_ref.iter().enumerate() {
+                let (m0, m1) = s.evb.parts(b);
+                for (i, e) in m0.iter().chain(m1.iter()).enumerate() {
+                    let id = ((ti as u32) << 26) | i as u32;
+                    let mut h = (mix(e.eid) >> 8) as usize & mask;
+                    loop {
+                        let t = &mut table[h];
+                        if t.0 == u64::MAX {
+                            *t = (e.eid, e.ingest, id);
+                            break;
                         }
-                        break;
+                        if t.0 == e.eid {
+                            if e.ingest < t.1 {
+                                losers.push(t.2);
+                                t.1 = e.ingest;
+                                t.2 = id;
+                            } else {
+                                losers.push(id);
+                            }
+                            break;
+                        }
+                        h = (h + 1) & mask;
                     }
-                    h = (h + 1) & mask;
                 }
             }
-            for &t in table.iter() {
-                if t == u32::MAX {
-                    continue;
+            losers.sort_unstable();
+            // pass 2: sequential scan, skipping losers and invalid kept copies
+            let mut li = 0usize;
+            for (ti, s) in parsed_ref.iter().enumerate() {
+                let (m0, m1) = s.evb.parts(b);
+                for (i, e) in m0.iter().chain(m1.iter()).enumerate() {
+                    let id = ((ti as u32) << 26) | i as u32;
+                    if li < losers.len() && losers[li] == id {
+                        li += 1;
+                        continue;
+                    }
+                    if e.flags & 1 == 0 {
+                        continue;
+                    }
+                    let pb = (mix(e.person) >> (64 - PB_BITS)) as usize;
+                    out.push(pb, Sv { person: e.person, ts: ws + e.ts as i64, price: e.price, cat: e.cat, purchase: e.flags & 2 != 0 });
                 }
-                let e = &all[t as usize];
-                if e.flags & 1 == 0 {
-                    continue;
-                }
-                let pb = (mix(e.person) >> (64 - PB_BITS)) as usize;
-                out[pb].push(Sv { person: e.person, ts: ws + e.ts as i64, price: e.price, cat: e.cat, purchase: e.flags & 2 != 0 });
             }
         },
     );
     for st in &mut parsed {
-        st.evb = Vec::new();
+        st.evb = Buckets::new(1, 1);
     }
     lap("dedup");
 
@@ -1044,19 +1123,28 @@ fn main() {
             active: Vec::new(),
             catsum: vec![0; ncat],
             touched: Vec::new(),
+            evs: Vec::new(),
+            cks: Vec::new(),
         },
         |st, b| {
-            let mut evs: Vec<Sv> = Vec::new();
-            for (o, _, _) in dedup_ref {
-                evs.extend_from_slice(&o[b]);
+            let mut evs = std::mem::take(&mut st.evs);
+            evs.clear();
+            for (o, _, _) in dedup_ref.iter() {
+                let (m0, m1) = o.parts(b);
+                evs.extend_from_slice(m0);
+                evs.extend_from_slice(m1);
             }
             if evs.is_empty() {
+                st.evs = evs;
                 return;
             }
             evs.sort_unstable_by_key(|e| (e.person, e.ts));
-            let mut cks: Vec<Ck> = Vec::new();
+            let mut cks = std::mem::take(&mut st.cks);
+            cks.clear();
             for s in parsed_ref {
-                cks.extend_from_slice(&s.ckb[b]);
+                let (m0, m1) = s.ckb.parts(b);
+                cks.extend_from_slice(m0);
+                cks.extend_from_slice(m1);
             }
             cks.sort_unstable_by_key(|c| (c.person, c.ts));
 
@@ -1171,6 +1259,8 @@ fn main() {
                 st.active.clear();
                 i = j;
             }
+            st.evs = evs;
+            st.cks = cks;
         },
     );
     drop(dedup);
