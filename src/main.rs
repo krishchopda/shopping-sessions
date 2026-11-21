@@ -1211,7 +1211,12 @@ fn main() {
 
     // ---- links run on their own thread, concurrently with event/click parsing
     let link_dir = data_dir.join("links");
-    let link_handle = std::thread::spawn(move || build_links(&link_dir, 2));
+    let links: Arc<std::sync::OnceLock<(U64Map, HashMap<u64, Vec<u8>>)>> = Arc::new(std::sync::OnceLock::new());
+    let links_w = links.clone();
+    let link_handle = std::thread::spawn(move || {
+        let r = build_links(&link_dir, 2);
+        let _ = links_w.set(r);
+    });
 
     // ---- events + clicks
     let ev_maps = map_files(&list_csv(&data_dir.join("events")));
@@ -1242,15 +1247,17 @@ fn main() {
         ckb: Buckets<Ck>,
         reg: Reg,
         buf: Vec<u8>,
+        cpend: Vec<Ck>,
     }
     let mut parsed = par_for(
         nt,
         total_tasks,
         || ParseSt {
             evb: Buckets::new(n_evb, ev_res),
-            ckb: Buckets::new(1, (ck_res * n_pb).max(sv_res * n_pb / 2 + 1024)),
+            ckb: Buckets::new(n_pb, ck_res),
             reg: Reg::new(),
             buf: Vec::new(),
+            cpend: Vec::with_capacity(BATCH),
         },
         |st, i| {
             if i < ev_chunks.len() {
@@ -1302,6 +1309,9 @@ fn main() {
                 st.buf = buf;
             } else {
                 let c = &ck_chunks[i - ev_chunks.len()];
+                // click chunks are queued after every event chunk; the link
+                // thread has normally finished by the time one starts
+                let (po, _) = links.wait();
                 let mut buf = std::mem::take(&mut st.buf);
                 let data: &[u8] = read_chunk(&mut buf, &ck_files[c.file], c);
                 scan_lines(data, |f: &[&[u8]; 4]| {
@@ -1318,8 +1328,23 @@ fn main() {
                     };
                     let cid = key_of_padded(f[0], &mut st.reg);
                     let uid = key_of_padded(f[1], &mut st.reg);
-                    st.ckb.push(0, Ck { person: uid, ts, cid, camp });
+                    po.prefetch(uid);
+                    st.cpend.push(Ck { person: uid, ts, cid, camp });
+                    if st.cpend.len() == BATCH {
+                        for k in 0..BATCH {
+                            let mut c = st.cpend[k];
+                            c.person = po.get(c.person).unwrap_or(c.person);
+                            st.ckb.push((mix(c.person) >> (64 - pb_bits)) as usize, c);
+                        }
+                        st.cpend.clear();
+                    }
                 });
+                for k in 0..st.cpend.len() {
+                    let mut c = st.cpend[k];
+                    c.person = po.get(c.person).unwrap_or(c.person);
+                    st.ckb.push((mix(c.person) >> (64 - pb_bits)) as usize, c);
+                }
+                st.cpend.clear();
                 st.buf = buf;
             }
         },
@@ -1329,7 +1354,8 @@ fn main() {
         st.ckb.finish();
     }
     lap("parse events+clicks");
-    let (person_of, mut reg) = link_handle.join().unwrap();
+    link_handle.join().unwrap();
+    let (person_of, mut reg) = Arc::try_unwrap(links).ok().expect("links still shared").into_inner().expect("links built");
     for st in &mut parsed {
         for (k, b) in st.reg.drain(..) {
             reg.entry(k).or_insert(b);
@@ -1338,51 +1364,8 @@ fn main() {
     lap("links joined");
     let person_of_ref = &person_of;
 
-    // ---- clicks: resolve persons (prefetched batches) and partition by person
-    const CK_TASK: usize = 1 << 16;
-    let mut ck_tasks: Vec<(usize, usize)> = vec![];
-    for (ti, st) in parsed.iter().enumerate() {
-        let n = st.ckb.len(0);
-        let mut o = 0;
-        while o < n {
-            ck_tasks.push((ti, o));
-            o += CK_TASK;
-        }
-    }
-    let parsed_ref = &parsed;
-    let ck_parts = par_for(
-        nt,
-        ck_tasks.len(),
-        || Buckets::<Ck>::new(n_pb, ck_res * 2),
-        |out, t| {
-            let (ti, o) = ck_tasks[t];
-            let (m0, m1) = parsed_ref[ti].ckb.parts(0);
-            let n = m0.len() + m1.len();
-            let end = (o + CK_TASK).min(n);
-            let get = |i: usize| if i < m0.len() { m0[i] } else { m1[i - m0.len()] };
-            let mut i = o;
-            while i < end {
-                let e2 = (i + BATCH).min(end);
-                for k in i..e2 {
-                    person_of_ref.prefetch(get(k).person);
-                }
-                for k in i..e2 {
-                    let mut c = get(k);
-                    c.person = person_of_ref.get(c.person).unwrap_or(c.person);
-                    out.push((mix(c.person) >> (64 - pb_bits)) as usize, c);
-                }
-                i = e2;
-            }
-        },
-    );
-    let mut ck_parts = ck_parts;
-    for c in &mut ck_parts {
-        c.finish();
-    }
-    let mut parsed = parsed;
-    for st in &mut parsed {
-        st.ckb = Buckets::new(1, 1);
-    }
+    // clicks were resolved and partitioned by person during parsing
+    let ck_parts: Vec<Buckets<Ck>> = parsed.iter_mut().map(|st| std::mem::replace(&mut st.ckb, Buckets::new(1, 1))).collect();
 
     // ---- dedup
     let parsed_ref = &parsed;
