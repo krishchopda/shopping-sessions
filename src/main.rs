@@ -827,6 +827,23 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     parse_ts(rest[..q].as_bytes()).expect("manifest ts")
 }
 
+/// Set once in main before any parsing: AVX-512BW available at run time.
+static mut USE_512: bool = false;
+
+/// The same three masks with one 64-byte load and three k-mask compares.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn masks64_512(p: &[u8; 64]) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p.as_ptr() as *const __m512i);
+    (
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+    )
+}
+
 /// Structural bitmasks (comma, quote, newline) for 64 bytes.
 #[inline(always)]
 fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
@@ -870,7 +887,24 @@ fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
 /// Only commas and newlines are visited; a field's quotes are counted with
 /// popcnt on the quote bitmask and its wrapping is decided without branches.
 #[inline(always)]
-fn scan_lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+fn scan_lines<'a, const N: usize>(data: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if unsafe { USE_512 } {
+            return unsafe { scan_lines_512(data, f) };
+        }
+    }
+    scan_core(data, f, masks64)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn scan_lines_512<'a, const N: usize>(data: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
+    scan_core(data, f, |p: &[u8; 64]| unsafe { masks64_512(p) })
+}
+
+#[inline(always)]
+fn scan_core<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N]), masks64: impl Fn(&[u8; 64]) -> (u64, u64, u64)) {
     let len = data.len();
     let mut fields: [&'a [u8]; N] = [&[]; N];
     let mut nf = 0usize;
@@ -1176,6 +1210,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8))
         .max(1);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        USE_512 = std::env::var_os("X_NO512").is_none() && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
+    }
     let t0 = std::time::Instant::now();
     let lap = |what: &str| eprintln!("{:>8.1} ms  {}", t0.elapsed().as_secs_f64() * 1e3, what);
 
@@ -1577,7 +1615,7 @@ fn main() {
             }
             for q in 0..np {
                 let (x, y) = (st.eoff[q] as usize, st.eoff[q + 1] as usize);
-                if y - x > 1 {
+                if y - x > 1 && !evs[x..y].is_sorted_by_key(|e| e.ts) {
                     evs[x..y].sort_unstable_by_key(|e| e.ts);
                 }
             }
@@ -1620,7 +1658,7 @@ fn main() {
             }
             for q in 0..np {
                 let (x, y) = (st.coff[q] as usize, st.coff[q + 1] as usize);
-                if y - x > 1 {
+                if y - x > 1 && !cks[x..y].is_sorted_by_key(|c| c.ts) {
                     cks[x..y].sort_unstable_by_key(|c| c.ts);
                 }
             }
@@ -1991,7 +2029,12 @@ mod tests {
     fn collect<const N: usize>(d: &[u8], fast: bool) -> Vec<Vec<Vec<u8>>> {
         let mut out = vec![];
         if fast {
-            scan_lines::<N>(d, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+            scan_core::<N>(d, |f| out.push(f.iter().map(|x| x.to_vec()).collect()), masks64);
+            if is_x86_feature_detected!("avx512bw") {
+                let mut o2 = vec![];
+                unsafe { scan_lines_512::<N>(d, |f| o2.push(f.iter().map(|x| x.to_vec()).collect::<Vec<Vec<u8>>>())) };
+                assert_eq!(o2, out, "avx512 path differs");
+            }
         } else {
             scan_lines_ref::<N>(d, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
         }
