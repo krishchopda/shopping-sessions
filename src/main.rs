@@ -27,8 +27,6 @@ const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const FALLBACK: u64 = 1 << 63;
 const CHUNK: usize = 2 << 20;
-const EV_BITS: u32 = 8; // 256 event buckets
-const PB_BITS: u32 = 9; // 512 person buckets
 
 // ---------------------------------------------------------------- keys
 
@@ -908,9 +906,11 @@ fn scan_lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; 
             } else {
                 quotes_slow(&data[fstart..pos])
             };
+            // branch-free: wrapped iff exactly 2 quotes, at the field's two ends
             let flen = pos - fstart;
-            let wrapped = qc == 2 && flen >= 2 && data[fstart] == b'"' && data[pos - 1] == b'"';
-            bad |= qc != 0 && !wrapped;
+            let (fq, lq) = unsafe { (*data.get_unchecked(fstart) == b'"', *data.get_unchecked(pos.wrapping_sub(1).min(pos)) == b'"') };
+            let wrapped = (qc == 2) & (flen >= 2) & fq & lq;
+            bad |= (qc != 0) & !wrapped;
             let w = wrapped as usize;
             let v: &'a [u8] = unsafe { data.get_unchecked(fstart + w..pos - w) };
             if nf < N {
@@ -1218,11 +1218,17 @@ fn main() {
     let ck_chunks = chunks(&ck_maps);
     let ev_files = open_files(&list_csv(&data_dir.join("events")));
     let ck_files = open_files(&list_csv(&data_dir.join("clicks")));
-    let n_evb = 1usize << EV_BITS;
-    let n_pb = 1usize << PB_BITS;
     let total_tasks = ev_chunks.len() + ck_chunks.len();
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
+    // Bucket counts follow the input size so each bucket's working set
+    // (dedup table, person grouping) stays around L2 size: ~40k events each.
+    let est_events = ev_bytes / 62 + 1;
+    let bits_for = |n: usize| -> u32 { (usize::BITS - (n / 40_000).leading_zeros()).clamp(8, 11) };
+    let ev_bits: u32 = bits_for(est_events);
+    let pb_bits: u32 = bits_for(est_events);
+    let n_evb = 1usize << ev_bits;
+    let n_pb = 1usize << pb_bits;
     // generous per-thread reservations: untouched capacity costs no page faults
     let ev_res = ev_bytes / 62 / nt / n_evb * 5 / 4 + 64;
     let ck_res = ck_bytes / 45 / nt / n_pb * 3 / 2 + 64;
@@ -1284,10 +1290,10 @@ fn main() {
                     if valid {
                         let uid = key_of_padded(f[1], &mut st.reg);
                         let cat = if purchase { prod_lu.get(f[5]).map(|c| c as u16).unwrap_or(unknown_cat) } else { 0 };
-                        let b = (mix(eid) >> (64 - EV_BITS)) as usize;
+                        let b = (mix(eid) >> (64 - ev_bits)) as usize;
                         st.evb.push(b, Ev { eid, person: uid, ts: (ts - ws) as u32, ingest, price, cat, flags });
                     } else {
-                        let b = (mix(eid) >> (64 - EV_BITS)) as usize;
+                        let b = (mix(eid) >> (64 - ev_bits)) as usize;
                         st.evb.push(b, Ev { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, flags });
                     }
                 });
@@ -1361,7 +1367,7 @@ fn main() {
                 for k in i..e2 {
                     let mut c = get(k);
                     c.person = person_of_ref.get(c.person).unwrap_or(c.person);
-                    out.push((mix(c.person) >> (64 - PB_BITS)) as usize, c);
+                    out.push((mix(c.person) >> (64 - pb_bits)) as usize, c);
                 }
                 i = e2;
             }
@@ -1437,14 +1443,14 @@ fn main() {
                     if pend.len() == BATCH {
                         for mut v in pend.drain(..) {
                             v.person = person_of_ref.get(v.person).unwrap_or(v.person);
-                            out.push((mix(v.person) >> (64 - PB_BITS)) as usize, v);
+                            out.push((mix(v.person) >> (64 - pb_bits)) as usize, v);
                         }
                     }
                 }
             }
             for mut v in pend.drain(..) {
                 v.person = person_of_ref.get(v.person).unwrap_or(v.person);
-                out.push((mix(v.person) >> (64 - PB_BITS)) as usize, v);
+                out.push((mix(v.person) >> (64 - pb_bits)) as usize, v);
             }
         },
     );
