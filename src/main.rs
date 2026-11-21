@@ -296,18 +296,47 @@ fn civil(s: &[u8]) -> Option<i64> {
     let k2 = u16::from_le_bytes(s[8..10].try_into().unwrap());
     let e = unsafe { *std::ptr::addr_of!(DATE_TAB).cast::<(u64, u16, i64)>().add(date_slot(s)) };
     if e.0 == k8 && e.1 == k2 && e.0 != 0 {
-        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
-            return None;
-        }
-        let h = dig2(&s[11..13])?;
-        let mi = dig2(&s[14..16])?;
-        let se = dig2(&s[17..19])?;
-        if h > 23 || mi > 59 || se > 59 {
-            return None;
-        }
-        return Some(e.2 + (h * 3600 + mi * 60 + se) * 1000);
+        // branch-free "THH:MM:SS"
+        let d = |i: usize| s[i].wrapping_sub(b'0');
+        let (h1, h2, m1, m2, s1, s2) = (d(11), d(12), d(14), d(15), d(17), d(18));
+        let h = h1 as i64 * 10 + h2 as i64;
+        let mi = m1 as i64 * 10 + m2 as i64;
+        let se = s1 as i64 * 10 + s2 as i64;
+        let ok = (h1 < 10) & (h2 < 10) & (m1 < 10) & (m2 < 10) & (s1 < 10) & (s2 < 10)
+            & (s[10] == b'T') & (s[13] == b':') & (s[16] == b':') & (h < 24) & (mi < 60) & (se < 60);
+        return if ok { Some(e.2 + (h * 3600 + mi * 60 + se) * 1000) } else { None };
     }
     civil_slow(s)
+}
+
+/// event_type: 0 = view/cart, 1 = purchase, 2 = anything else.
+#[inline(always)]
+fn etype(s: &[u8]) -> u8 {
+    match s.len() {
+        4 => {
+            let x = u32::from_le_bytes(s[0..4].try_into().unwrap());
+            if x == u32::from_le_bytes(*b"view") || x == u32::from_le_bytes(*b"cart") { 0 } else { 2 }
+        }
+        8 => {
+            if u64::from_le_bytes(s[0..8].try_into().unwrap()) == u64::from_le_bytes(*b"purchase") { 1 } else { 2 }
+        }
+        _ => 2,
+    }
+}
+
+/// 8 ASCII digits (little-endian load, first char lowest) -> value, or None.
+#[inline(always)]
+fn digits8(x: u64) -> Option<u64> {
+    let ok = (x & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+        && (x.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030;
+    if !ok {
+        return None;
+    }
+    let mut v = x & 0x0F0F_0F0F_0F0F_0F0F;
+    v = v.wrapping_mul(2561) >> 8;
+    v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    v = (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32;
+    Some(v)
 }
 
 #[cold]
@@ -373,6 +402,11 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
             return Some(civil(s)? - sign * (oh * 60 + om) * 60_000);
         }
         return None;
+    }
+    if n == 13 {
+        let a = digits8(u64::from_le_bytes(s[0..8].try_into().unwrap()))?;
+        let b = digits8(u64::from_le_bytes(s[5..13].try_into().unwrap()))?;
+        return Some((a * 100_000 + b % 100_000) as i64);
     }
     let mut v: i64 = 0;
     let mut over = false;
@@ -1122,6 +1156,46 @@ fn scan_lines_old<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u
 
 
 #[allow(dead_code)]
+fn parse_bench(path: &Path) {
+    let data = fs::read(path).unwrap();
+    let cut = data.iter().rposition(|&b| b == b'\n').unwrap() + 1;
+    let mut buf = data[..cut].to_vec();
+    buf.extend_from_slice(&[0u8; 64]);
+    let data = &buf[..cut];
+    let lines = data.iter().filter(|&&b| b == b'\n').count() as f64;
+    let mut reg: Reg = Vec::new();
+    let mut best = [f64::MAX; 5];
+    for _ in 0..7 {
+        for v in 0..5 {
+            let t = std::time::Instant::now();
+            let mut acc = 0u64;
+            scan_lines(data, |f: &[&[u8]; 7]| {
+                if v >= 1 {
+                    acc = acc.wrapping_add(key_of_padded(f[0], &mut reg));
+                    acc = acc.wrapping_add(key_of_padded(f[1], &mut reg));
+                }
+                if v >= 2 {
+                    acc = acc.wrapping_add(parse_ts(f[2]).unwrap_or(7) as u64);
+                    acc = acc.wrapping_add(parse_ts(f[3]).unwrap_or(9) as u64);
+                }
+                if v >= 3 {
+                    let k = match etype(f[4]) { 0 => 1, 1 => parse_price(f[6]).unwrap_or(3) as u64, _ => 5 };
+                    acc = acc.wrapping_add(k);
+                }
+                if v >= 4 {
+                    acc = acc.wrapping_add(f[5].len() as u64);
+                }
+                acc = acc.wrapping_add(f[2].len() as u64);
+            });
+            std::hint::black_box(acc);
+            best[v] = best[v].min(t.elapsed().as_secs_f64());
+        }
+    }
+    let ns: Vec<String> = best.iter().map(|b| format!("{:.1}", b * 1e9 / lines)).collect();
+    eprintln!("scan / +keys / +ts / +validate / +cat: {}", ns.join(" / "));
+}
+
+#[allow(dead_code)]
 fn scan_bench(path: &Path) {
     let data = fs::read(path).unwrap();
     let data = &data[..data.len().min(400 << 20)];
@@ -1280,6 +1354,11 @@ fn main() {
     if let Ok(v) = std::env::var("X_NT") {
         USE_NT.store(v != "0", Ordering::Relaxed);
     }
+    if let Ok(p) = std::env::var("X_PARSEBENCH") {
+        fill_date_tab(20630, 20660);
+        parse_bench(Path::new(&p));
+        return;
+    }
     if let Ok(p) = std::env::var("X_SCANBENCH") {
         scan_bench(Path::new(&p));
         return;
@@ -1401,9 +1480,9 @@ fn main() {
                     };
                     let mut purchase = false;
                     let mut price = 0u32;
-                    match f[4] {
-                        b"view" | b"cart" => {}
-                        b"purchase" => {
+                    match etype(f[4]) {
+                        0 => {}
+                        1 => {
                             purchase = true;
                             match parse_price(f[6]) {
                                 Some(p) => price = p,
@@ -2068,6 +2147,71 @@ mod tests {
             scan_lines_ref::<N>(d, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
         }
         out
+    }
+    fn parse_ts_ref(s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if n == 0 { return None; }
+        if n >= 20 && s[4] == b'-' {
+            if n == 20 { if s[19] != b'Z' { return None; } return civil_slow(s); }
+            if n == 25 {
+                let sign = match s[19] { b'+' => 1, b'-' => -1, _ => return None };
+                if s[22] != b':' { return None; }
+                let oh = dig2(&s[20..22])?; let om = dig2(&s[23..25])?;
+                if oh > 23 || om > 59 { return None; }
+                return Some(civil_slow(s)? - sign * (oh * 60 + om) * 60_000);
+            }
+            return None;
+        }
+        let mut v: i64 = 0; let mut over = false;
+        for &c in s {
+            let d = c.wrapping_sub(b'0');
+            if d >= 10 { return None; }
+            if !over { match v.checked_mul(10).and_then(|x| x.checked_add(d as i64)) { Some(x) => v = x, None => over = true } }
+        }
+        Some(if over { i64::MAX } else { v })
+    }
+    #[test]
+    fn parse_ts_matches_reference() {
+        fill_date_tab(20630, 20660);
+        let mut x: u64 = 777;
+        let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let noise = b"0123456789:-TZ+ /a\x00\xff";
+        for _ in 0..2_000_000 {
+            let base = 1_783_000_000_000i64 + (rnd() % 1_500_000_000) as i64;
+            let secs = base / 1000;
+            let day = secs.div_euclid(86400);
+            let z = day + 719_468; let era = z.div_euclid(146_097); let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1; let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = yoe + era * 400 + (m <= 2) as i64;
+            let tod = secs.rem_euclid(86400);
+            let mut s = match rnd() % 3 {
+                0 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, tod / 3600, tod / 60 % 60, tod % 60).into_bytes(),
+                1 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+0{}:30", y, m, d, tod / 3600, tod / 60 % 60, tod % 60, rnd() % 10).into_bytes(),
+                _ => format!("{}", base).into_bytes(),
+            };
+            let k = rnd() % 4;
+            for _ in 0..k {
+                if s.is_empty() { break; }
+                let p = (rnd() as usize) % s.len();
+                match rnd() % 3 {
+                    0 => s[p] = noise[(rnd() as usize) % noise.len()],
+                    1 => if rnd() % 4 == 0 { s.remove(p); },
+                    _ => if rnd() % 8 == 0 { s.insert(p, b'9'); },
+                }
+            }
+            assert_eq!(parse_ts(&s), parse_ts_ref(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+        for t in [&b"9999999999999"[..], b"0000000000000", b"99999999999999999999", b"2026-02-30T00:00:00Z", b"2026-07-10T24:00:00Z", b"2026-07-10T23:59:60Z"] {
+            assert_eq!(parse_ts(t), parse_ts_ref(t));
+        }
+    }
+    #[test]
+    fn etype_matches() {
+        for (s, e) in [(&b"view"[..], 0), (b"cart", 0), (b"purchase", 1), (b"View", 2), (b"", 2), (b"purchas", 2), (b"purchasee", 2), (b"vie", 2), (b" view", 2)] {
+            assert_eq!(etype(s), e);
+        }
     }
     #[test]
     fn scanner_matches_reference() {
