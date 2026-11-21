@@ -1766,6 +1766,10 @@ fn main() {
         write_campaign(&cdd.join("part-000.parquet"), &rows, &camps, day0);
     });
     lap("write");
+    // PGO training runs must exit normally so the profile gets written.
+    if std::env::var_os("X_PGO_TRAIN").is_some() {
+        std::process::exit(0);
+    }
     // Skip destructors and allocator teardown: the kernel reclaims everything.
     unsafe { libc::_exit(0) };
 }
