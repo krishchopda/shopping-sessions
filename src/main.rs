@@ -555,10 +555,30 @@ fn sfence() {
     }
 }
 
+/// Released slab regions, reused by later stages so their pages (already
+/// faulted and zeroed once) are not zeroed again by the kernel.
+static POOL: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
 impl<T: Copy> Buckets<T> {
     fn new(nb: usize, cap: usize) -> Self {
         let cap = (cap.max(1) + WC - 1) / WC * WC;
-        let bytes = (nb * cap * std::mem::size_of::<T>()).max(4096);
+        let need = (nb * cap * std::mem::size_of::<T>()).max(4096);
+        let reused = {
+            let mut pool = POOL.lock().unwrap();
+            let mut best: Option<usize> = None;
+            for (i, &(_, sz)) in pool.iter().enumerate() {
+                if sz >= need && best.map_or(true, |j| sz < pool[j].1) {
+                    best = Some(i);
+                }
+            }
+            best.map(|i| pool.swap_remove(i))
+        };
+        let mut wc = Vec::with_capacity(nb * WC);
+        unsafe { wc.set_len(nb * WC) };
+        if let Some((p, sz)) = reused {
+            return Buckets { ptr: p as *mut T, bytes: sz, cap, lens: vec![0; nb], spill: (0..nb).map(|_| Vec::new()).collect(), wc, wn: vec![0; nb] };
+        }
+        let bytes = need;
         let ptr = unsafe {
             let p = libc::mmap(
                 std::ptr::null_mut(),
@@ -627,7 +647,11 @@ impl<T: Copy> Buckets<T> {
 }
 impl<T: Copy> Drop for Buckets<T> {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.bytes) };
+        if self.bytes >= (4 << 20) {
+            POOL.lock().unwrap().push((self.ptr as usize, self.bytes));
+        } else {
+            unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.bytes) };
+        }
     }
 }
 
@@ -1067,6 +1091,7 @@ fn main() {
     // generous per-thread reservations: untouched capacity costs no page faults
     let ev_res = ev_bytes / 62 / nt / n_evb * 5 / 4 + 64;
     let ck_res = ck_bytes / 45 / nt / n_pb * 3 / 2 + 64;
+    let sv_res = ev_bytes / 62 / nt / n_pb * 5 / 4 + 64;
 
     const BATCH: usize = 32;
     struct ParseSt {
@@ -1080,7 +1105,7 @@ fn main() {
         total_tasks,
         || ParseSt {
             evb: Buckets::new(n_evb, ev_res),
-            ckb: Buckets::new(1, ck_res * n_pb),
+            ckb: Buckets::new(1, (ck_res * n_pb).max(sv_res * n_pb / 2 + 1024)),
             reg: Reg::new(),
             buf: Vec::new(),
         },
@@ -1218,7 +1243,6 @@ fn main() {
 
     // ---- dedup
     let parsed_ref = &parsed;
-    let sv_res = ev_bytes / 62 / nt / n_pb * 5 / 4 + 64;
     let dedup = par_for(
         nt,
         n_evb,
@@ -1228,7 +1252,7 @@ fn main() {
             if n == 0 {
                 return;
             }
-            let cap = (n * 2).next_power_of_two();
+            let cap = (n + n / 2).next_power_of_two().max(64);
             let mask = cap - 1;
             table.clear();
             table.resize(cap, (u64::MAX, 0, 0));
@@ -1594,7 +1618,8 @@ fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
             reg.insert(*k, b.clone());
         }
     }
-    let mut idx = U64Map::with_capacity(npairs * 2 + 16);
+    // at most 2 * npairs distinct IDs; this keeps the load at or under 2/3
+    let mut idx = U64Map::with_capacity(npairs + npairs / 2 + 16);
     let mut ids: Vec<u64> = Vec::with_capacity(npairs * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(npairs * 2);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -1659,6 +1684,9 @@ fn props() -> Arc<WriterProperties> {
             .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
+            .set_write_batch_size(1 << 20)
+            .set_data_page_row_count_limit(1 << 22)
+            .set_data_page_size_limit(64 << 20)
             .build(),
     )
 }
@@ -1670,7 +1698,7 @@ fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64
         )
         .unwrap(),
     );
-    let f = File::create(path).unwrap();
+    let f = std::io::BufWriter::with_capacity(8 << 20, File::create(path).unwrap());
     let mut w = SerializedFileWriter::new(f, schema, props()).unwrap();
     let mut rg = w.next_row_group().unwrap();
     let mut col = 0;
@@ -1735,7 +1763,7 @@ fn write_campaign(path: &Path, rows: &[(usize, usize, [i64; 4])], camps: &[(Vec<
         )
         .unwrap(),
     );
-    let f = File::create(path).unwrap();
+    let f = std::io::BufWriter::with_capacity(8 << 20, File::create(path).unwrap());
     let mut w = SerializedFileWriter::new(f, schema, props()).unwrap();
     let mut rg = w.next_row_group().unwrap();
     let mut col = 0;
