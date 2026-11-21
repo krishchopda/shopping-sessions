@@ -667,6 +667,32 @@ fn map_files(paths: &[PathBuf]) -> Vec<Mmap> {
         .collect()
 }
 
+fn open_files(paths: &[PathBuf]) -> Vec<File> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let f = File::open(p).expect("open");
+            if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+                return None;
+            }
+            Some(f)
+        })
+        .collect()
+}
+
+/// Read a chunk with pread into a reusable buffer (cheaper than walking
+/// 4 KiB file page tables through mmap on a VM).
+#[inline(always)]
+fn read_chunk<'a>(buf: &'a mut Vec<u8>, f: &File, c: &Chunk) -> &'a [u8] {
+    use std::os::unix::fs::FileExt;
+    let n = c.end - c.start;
+    if buf.len() < n {
+        buf.resize(n, 0);
+    }
+    f.read_exact_at(&mut buf[..n], c.start as u64).expect("pread");
+    &buf[..n]
+}
+
 fn chunks(maps: &[Mmap]) -> Vec<Chunk> {
     let mut out = vec![];
     for (fi, m) in maps.iter().enumerate() {
@@ -963,6 +989,9 @@ fn main() {
     let ck_maps = map_files(&list_csv(&data_dir.join("clicks")));
     let ev_chunks = chunks(&ev_maps);
     let ck_chunks = chunks(&ck_maps);
+    let ev_files = open_files(&list_csv(&data_dir.join("events")));
+    let ck_files = open_files(&list_csv(&data_dir.join("clicks")));
+    let use_mmap = std::env::var("X_MMAP").is_ok();
     let n_evb = 1usize << EV_BITS;
     let n_pb = 1usize << PB_BITS;
     let total_tasks = ev_chunks.len() + ck_chunks.len();
@@ -977,6 +1006,7 @@ fn main() {
         evb: Buckets<Ev>,
         ckb: Buckets<Ck>,
         reg: Reg,
+        buf: Vec<u8>,
     }
     let mut parsed = par_for(
         nt,
@@ -985,11 +1015,14 @@ fn main() {
             evb: Buckets::new(n_evb, ev_res),
             ckb: Buckets::new(1, ck_res * n_pb),
             reg: Reg::new(),
+            buf: Vec::new(),
         },
         |st, i| {
             if i < ev_chunks.len() {
                 let c = &ev_chunks[i];
-                scan_lines(&ev_maps[c.file][c.start..c.end], |f: &[&[u8]; 7]| {
+                let mut buf = std::mem::take(&mut st.buf);
+                let data: &[u8] = if use_mmap { &ev_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ev_files[c.file], c) };
+                scan_lines(data, |f: &[&[u8]; 7]| {
                     if f[0].is_empty() {
                         return;
                     }
@@ -1031,9 +1064,12 @@ fn main() {
                         st.evb.push(b, Ev { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, flags });
                     }
                 });
+                st.buf = buf;
             } else {
                 let c = &ck_chunks[i - ev_chunks.len()];
-                scan_lines(&ck_maps[c.file][c.start..c.end], |f: &[&[u8]; 4]| {
+                let mut buf = std::mem::take(&mut st.buf);
+                let data: &[u8] = if use_mmap { &ck_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ck_files[c.file], c) };
+                scan_lines(data, |f: &[&[u8]; 4]| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
@@ -1049,6 +1085,7 @@ fn main() {
                     let uid = key_of(f[1], &mut st.reg);
                     st.ckb.push(0, Ck { person: uid, ts, cid, camp });
                 });
+                st.buf = buf;
             }
         },
     );
