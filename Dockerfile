@@ -24,5 +24,6 @@ RUN cargo build --release --locked --bin pgogen \
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/solver /app/solver
+ENV X_PROBE=1
 USER 1000:1000
 CMD ["/app/solver"]
