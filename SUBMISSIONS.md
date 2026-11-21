@@ -11,9 +11,14 @@ noise between machines is up to ~20%, so compare with care.
 | Sat 3:28 AM | BB-E47F9E64 | `7cd272d` | 1.33 s | G: F with 4 KiB pages instead of huge pages (huge pages win on the scorer) |
 | Sat 4:22 AM | BB-DD347833 | `fec3cdd` | 1.20 s | P: F + AVX-512BW classifier (runtime-dispatched), static binary, presorted-run check (research-brief build) |
 | Sat 4:29 AM | BB-BC8D2E27 | `74914a4` | 1.24 s | R2: F + dedup survivors routed by raw user ID, persons resolved per bucket (-4% CPU locally) |
+| Sat 5:22 AM | BB-C346EA67 | `ed298e9` | 1.23 s | R2 + profile-guided optimisation (PGO trained in the Docker build) |
+| Sat 5:30 AM | BB-A9DDAAE9 | `f16182b` | 1.18 s | F resubmitted unchanged to measure noise: F is genuinely ~1.17-1.18 |
 
 ## Lessons
 
+- F re-scored 1.18 s (was 1.17): F's time is real. Builds containing R2's
+  extra resolve pass (R2 1.24, R2+PGO 1.23) are ~5% slower on the scorer even
+  though R2 used 4% less CPU locally. Build on F, not R2.
 - F, P and R2 scored 1.17 / 1.20 / 1.24 s: inside board noise. Changes worth a
   few % locally do not show on the board; only a large change (15%+) can.
 
