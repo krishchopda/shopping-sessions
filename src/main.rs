@@ -26,7 +26,7 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const FALLBACK: u64 = 1 << 63;
-const CHUNK: usize = 2 << 20;
+const CHUNK: usize = 256 << 10; // L2-sized: the pread copy stays in cache
 
 // ---------------------------------------------------------------- keys
 
