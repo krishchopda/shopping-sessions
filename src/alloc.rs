@@ -25,6 +25,43 @@ pub static SMALLPAGES: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 const MADV_NOHUGEPAGE: i32 = 15;
 const MADV_POPULATE_WRITE: i32 = 23;
 
+/// Every big block handed out (start, bytes), so `release_all` can drop their pages on
+/// many threads before exit (process teardown frees every page on one thread).
+const MAXREG: usize = 1 << 16;
+static REG_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REG: [(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize); MAXREG] =
+    [const { (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)) }; MAXREG];
+
+#[inline]
+fn record(p: *mut u8, len: usize) {
+    let i = REG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if i < MAXREG {
+        REG[i].0.store(p as usize, std::sync::atomic::Ordering::Relaxed);
+        REG[i].1.store(len, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The recorded blocks, cut into pieces of at most `piece` bytes. Only for use once the
+/// program's work is done: a block freed or moved since may be listed (harmless then).
+pub fn regions(piece: usize) -> Vec<(usize, usize)> {
+    let n = REG_N.load(std::sync::atomic::Ordering::Relaxed).min(MAXREG);
+    let mut v = Vec::new();
+    for i in 0..n {
+        let (a, l) = (REG[i].0.load(std::sync::atomic::Ordering::Relaxed), REG[i].1.load(std::sync::atomic::Ordering::Relaxed));
+        let mut o = 0;
+        while o < l {
+            v.push((a + o, piece.min(l - o)));
+            o += piece;
+        }
+    }
+    v
+}
+
+/// Drops the pages of [a, a + len) (MADV_DONTNEED).
+pub fn drop_pages(a: usize, len: usize) {
+    unsafe { madvise(a as *mut u8, len, 4) };
+}
+
 #[inline]
 fn round(n: usize) -> usize {
     (n + HUGE - 1) & !(HUGE - 1)
@@ -54,6 +91,7 @@ unsafe fn big_alloc(size: usize) -> *mut u8 {
     if POPULATE.load(std::sync::atomic::Ordering::Relaxed) {
         madvise(aligned as *mut u8, len, MADV_POPULATE_WRITE);
     }
+    record(aligned as *mut u8, len);
     aligned as *mut u8
 }
 
@@ -102,6 +140,7 @@ unsafe impl GlobalAlloc for HugeAlloc {
             if p as isize == -1 {
                 return std::ptr::null_mut();
             }
+            record(p, nl);
             if SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) {
                 madvise(p, nl, MADV_NOHUGEPAGE);
             } else if !NOHUGE.load(std::sync::atomic::Ordering::Relaxed) {

@@ -4024,7 +4024,24 @@ fn main() {
     parquet::write(&cd.join("part-000.parquet"), &cols, nrows).unwrap();
     });
     eprintln!("done: {:?} cpu {:.3}", t0.elapsed(), cpu_now());
-    // Output files are complete and closed; skip destructors (unmapping GBs of buffers).
+    // Output files are complete and closed. Process exit would free every page of the
+    // big buffers on one thread: drop them on all threads first (NOREL=1: skip).
+    if std::env::var_os("NOREL").is_none() {
+        let regs = alloc::regions(64 << 20);
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..nthreads {
+                sc.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= regs.len() {
+                        break;
+                    }
+                    alloc::drop_pages(regs[i].0, regs[i].1);
+                });
+            }
+        });
+        eprintln!("released: {:?} ({} pieces)", t0.elapsed(), regs.len());
+    }
     std::process::exit(0);
 }
 
