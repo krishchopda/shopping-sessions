@@ -77,3 +77,5 @@ noise between machines is up to ~20%, so compare with care.
 | 713980e | knob-pfd1k | PFD=1024 (input prefetch 1 KB ahead) | **0.6432 s** (new best, within noise; re-run queued) |
 | a0c7b17 | knob-pfd2k | PFD=2048 | 0.6469 s (tie) |
 | 713980e | knob-pfd1k | PFD=1024, confirmation re-run | 0.6485 s (so the 0.6432 was noise; true speed ≈ 0.645–0.65 for every variant) |
+| 713980e | knob-pfd1k | re-run (defending top 30) | 0.6579 s |
+| 3bef6d7 | rust-pgo | re-run (defending top 30) | 0.6541 s |
