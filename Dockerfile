@@ -25,6 +25,6 @@ RUN set -e; \
 
 FROM scratch
 COPY --from=build /sessions /sessions
-ENV DATA_DIR=/data OUTPUT_DIR=/output
+ENV DATA_DIR=/data OUTPUT_DIR=/output PFD=1024
 USER 1000:1000
 CMD ["/sessions"]
