@@ -71,3 +71,5 @@ noise between machines is up to ~20%, so compare with care.
 | b4b1252 | dict-out | dictionary-encoded user_daily (82 → 40 MB) | 0.6707 s (worse; dropped) |
 | 2ab0317 | knob-combo | FPOP=1 CHUNK_KB=4096 AVX512=1 | 0.6798 s (worse) |
 | 0754cd8 | par-release | release big buffers on all threads before exit | 0.6501 s (tie) |
+| 7e45108 | knob-fpop | FPOP=1 | 0.6547 s (tie) |
+| 338884d | knob-chunk4m | CHUNK_KB=4096 | 0.6572 s (tie) |
