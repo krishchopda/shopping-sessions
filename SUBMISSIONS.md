@@ -40,3 +40,7 @@ noise between machines is up to ~20%, so compare with care.
 - Lesson: the local scanner gain did not show on the scorer (slightly worse, ~3%, within drift). Cached vs non-temporal stores: no difference.
 - BB-E59E1813 — control rerun of F+PGO @ 82847cb — **1.19 s** (same code scored 1.17 earlier: ~2% drift)
 - BB-E0BC035F — hot @ 5b244c4: branch-free time-of-day, SWAR 13-digit epoch, word-compare event type (bench 83 -> 57 ns/line) — **1.08 s** NEW BEST
+- BB-C0A67123 — pread-b @ feff65a (writer etc., pread) — 1.0990 s; BB-55421D68 same with mmap reads — 1.1254 s (mmap hurts ~2.5%)
+- BB-96A166C4 / BB-21CCABA8 — scorer probes: parse ends at ~0.58 s, write ends at ~1.13 s internal (fixed overhead ~0)
+- BB-1DB53ABD — exitrel @ f0d1c7a (parallel slab release before exit) — 1.1017 s (neutral)
+- BB-3AA013A0 — X_BITS=10 — 1.0895 s; BB-D39F9DA5 — X_BITS=11 — 2.3090 s (much worse)
