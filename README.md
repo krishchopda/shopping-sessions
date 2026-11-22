@@ -1,3 +1,16 @@
+# Shopping Sessions (team Indus Platonics)
+
+**The image builds `cpp/`**: a C++ pipeline written by teammate **Somesh Agrawal**,
+compiled with only its general path (the optional `SS_DENSE_BUILD` mode is not
+built). It parses events and clicks on every thread, dedups per event-ID bucket,
+groups each person's events into 30-minute slices with counting passes, and writes
+Parquet with its own minimal writer.
+
+The Rust pipeline in `src/` (Krish Chopda, with Claude) is the earlier entry
+(best 1.1577 s on scorer v5); it is kept in the repository with its tests.
+
+---
+
 # Shopping Sessions (Builders Buildathon, Databricks track)
 
 Team Indus Platonics. A hand-written Rust pipeline that turns the messy
