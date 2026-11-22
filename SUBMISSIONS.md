@@ -69,3 +69,5 @@ noise between machines is up to ~20%, so compare with care.
 | 0794e68 | probe-rs | timing probe 2 (sessions, write) | 11.5965 s → sessions ~0.15 s (write digit noisy) |
 | 83c8869 | probe-rs | timing probe 3 (write alone) | 10.1807 s → write ~0.018 s |
 | b4b1252 | dict-out | dictionary-encoded user_daily (82 → 40 MB) | 0.6707 s (worse; dropped) |
+| 2ab0317 | knob-combo | FPOP=1 CHUNK_KB=4096 AVX512=1 | 0.6798 s (worse) |
+| 0754cd8 | par-release | release big buffers on all threads before exit | 0.6501 s (tie) |
