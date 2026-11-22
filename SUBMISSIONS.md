@@ -73,3 +73,4 @@ noise between machines is up to ~20%, so compare with care.
 | 0754cd8 | par-release | release big buffers on all threads before exit | 0.6501 s (tie) |
 | 7e45108 | knob-fpop | FPOP=1 | 0.6547 s (tie) |
 | 338884d | knob-chunk4m | CHUNK_KB=4096 | 0.6572 s (tie) |
+| 7e9702f | knob-avx1 | AVX512=1 | 0.6756 s (worse; likely what sank the combo) |
