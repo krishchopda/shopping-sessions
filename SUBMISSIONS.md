@@ -74,3 +74,4 @@ noise between machines is up to ~20%, so compare with care.
 | 7e45108 | knob-fpop | FPOP=1 | 0.6547 s (tie) |
 | 338884d | knob-chunk4m | CHUNK_KB=4096 | 0.6572 s (tie) |
 | 7e9702f | knob-avx1 | AVX512=1 | 0.6756 s (worse; likely what sank the combo) |
+| 713980e | knob-pfd1k | PFD=1024 (input prefetch 1 KB ahead) | **0.6432 s** (new best, within noise; re-run queued) |
