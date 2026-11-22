@@ -125,15 +125,146 @@ fn unpack(v: u64, out: &mut Vec<u8>) {
 
 #[inline(always)]
 fn hash_bytes(s: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &c in s {
-        h ^= c as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    // word-at-a-time multiply-xorshift hash (fast for 30-50 byte IDs)
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h: u64 = 0x243F_6A88_85A3_08D3 ^ (s.len() as u64).wrapping_mul(K);
+    let mut it = s.chunks_exact(8);
+    for w in &mut it {
+        let x = u64::from_le_bytes(w.try_into().unwrap());
+        h = (h ^ x).wrapping_mul(K);
+        h ^= h >> 29;
     }
+    let r = it.remainder();
+    if !r.is_empty() {
+        let mut b = [0u8; 8];
+        b[..r.len()].copy_from_slice(r);
+        h = (h ^ u64::from_le_bytes(b)).wrapping_mul(K);
+        h ^= h >> 29;
+    }
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;
-    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     h ^= h >> 33;
     h
+}
+
+/// Bytes of long (FALLBACK) IDs seen by one parse thread, deduplicated.
+struct Names {
+    mask: usize,
+    keys: Vec<u64>,
+    vals: Vec<u64>, // offset << 24 | len
+    n: usize,
+    arena: Vec<u8>,
+}
+
+impl Names {
+    fn new() -> Self {
+        Names { mask: 1023, keys: vec![u64::MAX; 1024], vals: vec![0; 1024], n: 0, arena: Vec::new() }
+    }
+    #[inline(always)]
+    fn start(&self, k: u64) -> usize {
+        (mix(k) >> 24) as usize & self.mask
+    }
+    fn grow(&mut self) {
+        let cap = (self.mask + 1) * 2;
+        let (ok, ov) = (std::mem::take(&mut self.keys), std::mem::take(&mut self.vals));
+        self.keys = vec![u64::MAX; cap];
+        self.vals = vec![0; cap];
+        self.mask = cap - 1;
+        for (k, v) in ok.into_iter().zip(ov) {
+            if k != u64::MAX {
+                let mut i = self.start(k);
+                while self.keys[i] != u64::MAX {
+                    i = (i + 1) & self.mask;
+                }
+                self.keys[i] = k;
+                self.vals[i] = v;
+            }
+        }
+    }
+    #[inline]
+    fn add(&mut self, k: u64, s: &[u8]) {
+        let mut i = self.start(k);
+        loop {
+            let x = self.keys[i];
+            if x == k {
+                return;
+            }
+            if x == u64::MAX {
+                break;
+            }
+            i = (i + 1) & self.mask;
+        }
+        if (self.n + 1) * 3 > (self.mask + 1) * 2 {
+            self.grow();
+            i = self.start(k);
+            while self.keys[i] != u64::MAX {
+                i = (i + 1) & self.mask;
+            }
+        }
+        self.keys[i] = k;
+        self.vals[i] = ((self.arena.len() as u64) << 24) | s.len().min((1 << 24) - 1) as u64;
+        self.arena.extend_from_slice(s);
+        self.n += 1;
+    }
+    fn get(&self, k: u64) -> Option<&[u8]> {
+        let mut i = self.start(k);
+        loop {
+            let x = self.keys[i];
+            if x == k {
+                let v = self.vals[i];
+                let off = (v >> 24) as usize;
+                return Some(&self.arena[off..off + (v & ((1 << 24) - 1)) as usize]);
+            }
+            if x == u64::MAX {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// All long-ID bytes: from the links file and from every parse thread.
+struct AllNames {
+    links: HashMap<u64, Vec<u8>>,
+    parts: Vec<Names>,
+}
+
+impl AllNames {
+    fn get(&self, k: u64) -> Option<&[u8]> {
+        if let Some(b) = self.links.get(&k) {
+            return Some(b);
+        }
+        self.parts.iter().find_map(|p| p.get(k))
+    }
+}
+
+/// Key for an ID whose bytes are never needed again (event_id).
+#[inline(always)]
+fn key_anon(s: &[u8]) -> u64 {
+    match pack_padded(s) {
+        Some(k) => k,
+        None => match pack(s) {
+            Some(k) => k,
+            None => FALLBACK | (hash_bytes(s) >> 1),
+        },
+    }
+}
+
+/// Key for an ID whose bytes may be needed (user_id, click_id).
+#[inline(always)]
+fn key_named(s: &[u8], names: &mut Names) -> u64 {
+    match pack_padded(s) {
+        Some(k) => k,
+        None => match pack(s) {
+            Some(k) => k,
+            None => {
+                let k = FALLBACK | (hash_bytes(s) >> 1);
+                names.add(k, s);
+                k
+            }
+        },
+    }
 }
 
 type Reg = Vec<(u64, Vec<u8>)>;
@@ -155,7 +286,25 @@ fn mix(k: u64) -> u64 {
     k.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-fn bytes_of(k: u64, reg: &HashMap<u64, Vec<u8>>) -> Vec<u8> {
+fn bytes_of(k: u64, names: &AllNames) -> Vec<u8> {
+    if k & FALLBACK == 0 {
+        let mut v = Vec::with_capacity(12);
+        unpack(k, &mut v);
+        v
+    } else {
+        names.get(k).map(|b| b.to_vec()).unwrap_or_default()
+    }
+}
+
+fn key_less(a: u64, b: u64, names: &AllNames) -> bool {
+    if (a | b) & FALLBACK == 0 {
+        a < b
+    } else {
+        bytes_of(a, names) < bytes_of(b, names)
+    }
+}
+
+fn bytes_of_map(k: u64, reg: &HashMap<u64, Vec<u8>>) -> Vec<u8> {
     if k & FALLBACK == 0 {
         let mut v = Vec::with_capacity(12);
         unpack(k, &mut v);
@@ -165,12 +314,11 @@ fn bytes_of(k: u64, reg: &HashMap<u64, Vec<u8>>) -> Vec<u8> {
     }
 }
 
-#[inline(always)]
-fn key_less(a: u64, b: u64, reg: &HashMap<u64, Vec<u8>>) -> bool {
+fn key_less_map(a: u64, b: u64, reg: &HashMap<u64, Vec<u8>>) -> bool {
     if (a | b) & FALLBACK == 0 {
         a < b
     } else {
-        bytes_of(a, reg) < bytes_of(b, reg)
+        bytes_of_map(a, reg) < bytes_of_map(b, reg)
     }
 }
 
@@ -1493,7 +1641,7 @@ fn main() {
     struct ParseSt {
         evb: Buckets<Ev>,
         ckb: Buckets<Ck>,
-        reg: Reg,
+        reg: Names,
         buf: Vec<u8>,
         cpend: Vec<Ck>,
     }
@@ -1503,7 +1651,7 @@ fn main() {
         || ParseSt {
             evb: Buckets::new(n_evb, ev_res),
             ckb: Buckets::new(n_pb, ck_res),
-            reg: Reg::new(),
+            reg: Names::new(),
             buf: Vec::new(),
             cpend: Vec::with_capacity(BATCH),
         },
@@ -1516,7 +1664,7 @@ fn main() {
                     if f[0].is_empty() {
                         return;
                     }
-                    let eid = key_of_padded(f[0], &mut st.reg);
+                    let eid = key_anon(f[0]);
                     let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MIN / 2);
                     let ingest = (ingest_ms - ws).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                     let mut valid = !f[1].is_empty() && !f[5].is_empty();
@@ -1545,7 +1693,7 @@ fn main() {
                     }
                     let flags = valid as u8 | ((purchase as u8) << 1);
                     if valid {
-                        let uid = key_of_padded(f[1], &mut st.reg);
+                        let uid = key_named(f[1], &mut st.reg);
                         let cat = if purchase { prod_lu.get(f[5]).map(|c| c as u16).unwrap_or(unknown_cat) } else { 0 };
                         let b = (mix(eid) >> (64 - ev_bits)) as usize;
                         st.evb.push(b, Ev { eid, person: uid, ts: (ts - ws) as u32, ingest, price, cat, flags });
@@ -1574,8 +1722,8 @@ fn main() {
                         Some(c) => c,
                         None => return,
                     };
-                    let cid = key_of_padded(f[0], &mut st.reg);
-                    let uid = key_of_padded(f[1], &mut st.reg);
+                    let cid = key_named(f[0], &mut st.reg);
+                    let uid = key_named(f[1], &mut st.reg);
                     po.prefetch(uid);
                     st.cpend.push(Ck { person: uid, ts, cid, camp });
                     if st.cpend.len() == BATCH {
@@ -1606,12 +1754,8 @@ fn main() {
         unsafe { libc::_exit(0) };
     }
     link_handle.join().unwrap();
-    let (person_of, mut reg) = Arc::try_unwrap(links).ok().expect("links still shared").into_inner().expect("links built");
-    for st in &mut parsed {
-        for (k, b) in st.reg.drain(..) {
-            reg.entry(k).or_insert(b);
-        }
-    }
+    let (person_of, link_reg) = Arc::try_unwrap(links).ok().expect("links still shared").into_inner().expect("links built");
+    let reg = AllNames { links: link_reg, parts: parsed.iter_mut().map(|st| std::mem::replace(&mut st.reg, Names::new())).collect() };
     lap("links joined");
     let person_of_ref = &person_of;
 
@@ -2097,7 +2241,7 @@ fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
     for i in 0..ids.len() {
         let r = find(&mut parent, i as u32) as usize;
         let k = ids[i];
-        if name[r] == u64::MAX || key_less(k, name[r], &reg) {
+        if name[r] == u64::MAX || key_less_map(k, name[r], &reg) {
             name[r] = k;
         }
     }
@@ -2138,7 +2282,7 @@ fn props() -> Arc<WriterProperties> {
     )
 }
 
-fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64, Vec<u8>>) {
+fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &AllNames) {
     let schema = Arc::new(
         parse_message_type(
             "message user_daily { REQUIRED BYTE_ARRAY user_id (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT32 sessions; REQUIRED INT32 events; REQUIRED INT64 revenue_cents; OPTIONAL BYTE_ARRAY top_category (UTF8); }",
@@ -2200,15 +2344,15 @@ fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64
     w.close().unwrap();
 }
 
-fn write_user_fast(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &HashMap<u64, Vec<u8>>) {
+fn write_user_fast(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &AllNames) {
     let n = rows.len();
     let mut ub: Vec<u8> = Vec::with_capacity(n * 10);
     let mut ue: Vec<u32> = Vec::with_capacity(n);
     for r in rows {
         if r.person & FALLBACK == 0 {
             unpack(r.person, &mut ub);
-        } else {
-            ub.extend_from_slice(&bytes_of(r.person, reg));
+        } else if let Some(b) = reg.get(r.person) {
+            ub.extend_from_slice(b);
         }
         ue.push(ub.len() as u32);
     }
