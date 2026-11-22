@@ -159,6 +159,11 @@ impl Names {
     fn new() -> Self {
         Names { ents: Vec::new(), arena: Vec::new() }
     }
+    /// Reserve address space up front (untouched pages cost nothing), so the
+    /// log never reallocates and copies while parsing.
+    fn with_capacity(ents: usize) -> Self {
+        Names { ents: Vec::with_capacity(ents), arena: Vec::with_capacity(ents * 48) }
+    }
     #[inline]
     fn add(&mut self, k: u64, s: &[u8]) {
         let len = s.len().min((1 << 24) - 1);
@@ -1622,7 +1627,7 @@ fn main() {
         || ParseSt {
             evb: Buckets::new(n_evb, ev_res),
             ckb: Buckets::new(n_pb, ck_res),
-            reg: Names::new(),
+            reg: Names::with_capacity((ev_bytes + ck_bytes) / 64 / nt + 1024),
             buf: Vec::new(),
             cpend: Vec::with_capacity(BATCH),
         },
