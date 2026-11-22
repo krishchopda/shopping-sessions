@@ -148,79 +148,32 @@ fn hash_bytes(s: &[u8]) -> u64 {
     h
 }
 
-/// Bytes of long (FALLBACK) IDs seen by one parse thread, deduplicated.
+/// Bytes of long (FALLBACK) IDs seen by one parse thread: an append-only log
+/// during the parse (no random access), sorted and deduplicated afterwards.
 struct Names {
-    mask: usize,
-    keys: Vec<u64>,
-    vals: Vec<u64>, // offset << 24 | len
-    n: usize,
+    ents: Vec<(u64, u64)>, // key, offset << 24 | len
     arena: Vec<u8>,
 }
 
 impl Names {
     fn new() -> Self {
-        Names { mask: 1023, keys: vec![u64::MAX; 1024], vals: vec![0; 1024], n: 0, arena: Vec::new() }
-    }
-    #[inline(always)]
-    fn start(&self, k: u64) -> usize {
-        (mix(k) >> 24) as usize & self.mask
-    }
-    fn grow(&mut self) {
-        let cap = (self.mask + 1) * 2;
-        let (ok, ov) = (std::mem::take(&mut self.keys), std::mem::take(&mut self.vals));
-        self.keys = vec![u64::MAX; cap];
-        self.vals = vec![0; cap];
-        self.mask = cap - 1;
-        for (k, v) in ok.into_iter().zip(ov) {
-            if k != u64::MAX {
-                let mut i = self.start(k);
-                while self.keys[i] != u64::MAX {
-                    i = (i + 1) & self.mask;
-                }
-                self.keys[i] = k;
-                self.vals[i] = v;
-            }
-        }
+        Names { ents: Vec::new(), arena: Vec::new() }
     }
     #[inline]
     fn add(&mut self, k: u64, s: &[u8]) {
-        let mut i = self.start(k);
-        loop {
-            let x = self.keys[i];
-            if x == k {
-                return;
-            }
-            if x == u64::MAX {
-                break;
-            }
-            i = (i + 1) & self.mask;
-        }
-        if (self.n + 1) * 3 > (self.mask + 1) * 2 {
-            self.grow();
-            i = self.start(k);
-            while self.keys[i] != u64::MAX {
-                i = (i + 1) & self.mask;
-            }
-        }
-        self.keys[i] = k;
-        self.vals[i] = ((self.arena.len() as u64) << 24) | s.len().min((1 << 24) - 1) as u64;
-        self.arena.extend_from_slice(s);
-        self.n += 1;
+        let len = s.len().min((1 << 24) - 1);
+        self.ents.push((k, ((self.arena.len() as u64) << 24) | len as u64));
+        self.arena.extend_from_slice(&s[..len]);
+    }
+    fn finalize(&mut self) {
+        self.ents.sort_unstable_by_key(|e| e.0);
+        self.ents.dedup_by_key(|e| e.0);
     }
     fn get(&self, k: u64) -> Option<&[u8]> {
-        let mut i = self.start(k);
-        loop {
-            let x = self.keys[i];
-            if x == k {
-                let v = self.vals[i];
-                let off = (v >> 24) as usize;
-                return Some(&self.arena[off..off + (v & ((1 << 24) - 1)) as usize]);
-            }
-            if x == u64::MAX {
-                return None;
-            }
-            i = (i + 1) & self.mask;
-        }
+        let i = self.ents.binary_search_by_key(&k, |e| e.0).ok()?;
+        let v = self.ents[i].1;
+        let off = (v >> 24) as usize;
+        Some(&self.arena[off..off + (v & ((1 << 24) - 1)) as usize])
     }
 }
 
@@ -1773,7 +1726,15 @@ fn main() {
     }
     link_handle.join().unwrap();
     let (person_of, link_reg) = Arc::try_unwrap(links).ok().expect("links still shared").into_inner().expect("links built");
-    let reg = AllNames { links: link_reg, parts: parsed.iter_mut().map(|st| std::mem::replace(&mut st.reg, Names::new())).collect() };
+    let mut name_parts: Vec<Names> = parsed.iter_mut().map(|st| std::mem::replace(&mut st.reg, Names::new())).collect();
+    std::thread::scope(|sc| {
+        for p in name_parts.iter_mut() {
+            if !p.ents.is_empty() {
+                sc.spawn(move || p.finalize());
+            }
+        }
+    });
+    let reg = AllNames { links: link_reg, parts: name_parts };
     lap("links joined");
     let person_of_ref = &person_of;
 
@@ -2367,11 +2328,15 @@ fn write_user_fast(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], reg: &AllNam
     let n = rows.len();
     let mut ub: Vec<u8> = Vec::with_capacity(n * 10);
     let mut ue: Vec<u32> = Vec::with_capacity(n);
+    let mut last: (u64, &[u8]) = (u64::MAX, &[]);
     for r in rows {
         if r.person & FALLBACK == 0 {
             unpack(r.person, &mut ub);
-        } else if let Some(b) = reg.get(r.person) {
-            ub.extend_from_slice(b);
+        } else {
+            if last.0 != r.person {
+                last = (r.person, reg.get(r.person).unwrap_or(&[]));
+            }
+            ub.extend_from_slice(last.1);
         }
         ue.push(ub.len() as u32);
     }
