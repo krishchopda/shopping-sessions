@@ -2796,6 +2796,27 @@ impl UserCols {
     }
 }
 
+/// A dictionary of the distinct values of `v` (PLAIN int64, in first-seen order)
+/// and each value's index, or None when most values are distinct.
+fn i64_dict(v: &[i64]) -> Option<(Vec<u8>, usize, Vec<u32>)> {
+    let mut map: HashMap<i64, u32> = HashMap::with_capacity(1024);
+    let mut dict: Vec<u8> = Vec::new();
+    let mut idx: Vec<u32> = Vec::with_capacity(v.len());
+    for &x in v {
+        let n = map.len() as u32;
+        let i = *map.entry(x).or_insert_with(|| {
+            dict.extend_from_slice(&x.to_le_bytes());
+            n
+        });
+        idx.push(i);
+        if map.len() > v.len() / 4 + 64 {
+            return None;
+        }
+    }
+    let n = map.len();
+    Some((dict, n, idx))
+}
+
 fn enc_of<'a>(d: Option<(Vec<u8>, usize)>, idx: &'a [u32], plain: &'a [u8]) -> parquet::Enc<'a> {
     match d {
         Some((dict, ndict)) => parquet::Enc::Dict { dict, ndict, idx },
@@ -4013,12 +4034,16 @@ fn main() {
                 let (dday, iday, pday) = mk(&dd, &c.day);
                 let (dses, ises, pses) = mk(&sd, &c.sess);
                 let (devs, ievs, pevs) = mk(&ed, &c.ev);
+                let (drev, irev) = match i64_dict(&c.rev) {
+                    Some((dict, n, idx)) => (Some((dict, n)), idx),
+                    None => (None, Vec::new()),
+                };
                 let cols = [
                     DCol { name: "user_id", ty: Ty::Str, defs: None, enc: Enc::Dict { dict: c.uid_dict.clone(), ndict: c.nuid as usize, idx: &c.uid_idx } },
                     DCol { name: "day", ty: Ty::Date, defs: None, enc: enc_of(dday, &iday, &pday) },
                     DCol { name: "sessions", ty: Ty::I32, defs: None, enc: enc_of(dses, &ises, &pses) },
                     DCol { name: "events", ty: Ty::I32, defs: None, enc: enc_of(devs, &ievs, &pevs) },
-                    DCol { name: "revenue_cents", ty: Ty::I64, defs: None, enc: Enc::Plain(parquet::bytes_of(&c.rev)) },
+                    DCol { name: "revenue_cents", ty: Ty::I64, defs: None, enc: enc_of(drev, &irev, parquet::bytes_of(&c.rev)) },
                     DCol { name: "top_category", ty: Ty::Str, defs: Some(&c.defs), enc: Enc::Dict { dict: cat_dict.clone(), ndict: cat_names.len(), idx: &c.top_idx } },
                 ];
                 parquet::write_dcols(&ud.join(format!("part-{:03}.parquet", t)), &cols, c.n).unwrap();
