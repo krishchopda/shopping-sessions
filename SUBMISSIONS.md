@@ -65,3 +65,7 @@ noise between machines is up to ~20%, so compare with care.
 |---|---|---|---|
 | 40df30d | rust-somesh | plain static x86-64-v3 build | 0.6652 s |
 | 3bef6d7 | rust-pgo | PGO, trained on official-generator seeds 7 and 8 | **0.6450 s** (best) |
+| dc98ba6 | probe-rs | timing probe 1 (parse, dedup) | 13.0052 s → parse 0.30 s, dedup 0.05 s |
+| 0794e68 | probe-rs | timing probe 2 (sessions, write) | 11.5965 s → sessions ~0.15 s (write digit noisy) |
+| 83c8869 | probe-rs | timing probe 3 (write alone) | 10.1807 s → write ~0.018 s |
+| b4b1252 | dict-out | dictionary-encoded user_daily (82 → 40 MB) | 0.6707 s (worse; dropped) |
