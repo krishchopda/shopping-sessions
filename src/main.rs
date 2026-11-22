@@ -316,10 +316,28 @@ fn bytes_of_map(k: u64, reg: &HashMap<u64, Vec<u8>>) -> Vec<u8> {
 
 fn key_less_map(a: u64, b: u64, reg: &HashMap<u64, Vec<u8>>) -> bool {
     if (a | b) & FALLBACK == 0 {
-        a < b
-    } else {
-        bytes_of_map(a, reg) < bytes_of_map(b, reg)
+        return a < b;
     }
+    // compare without allocating: packed keys unpack into small stack buffers
+    let mut ba = [0u8; 10];
+    let mut bb = [0u8; 10];
+    fn view<'x>(k: u64, buf: &'x mut [u8; 10], reg: &'x HashMap<u64, Vec<u8>>) -> &'x [u8] {
+        if k & FALLBACK == 0 {
+            let mut n = 0;
+            for i in (0..10).rev() {
+                let r = ((k >> (6 * i)) & 63) as u8;
+                if r == 0 {
+                    break;
+                }
+                buf[n] = if r <= 10 { b'0' + r - 1 } else { b'a' + r - 11 };
+                n += 1;
+            }
+            &buf[..n]
+        } else {
+            reg.get(&k).map(|v| v.as_slice()).unwrap_or(&[])
+        }
+    }
+    view(a, &mut ba, reg) < view(b, &mut bb, reg)
 }
 
 // ---------------------------------------------------------------- csv
@@ -2197,10 +2215,11 @@ fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
     );
     let mut reg: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut npairs = 0;
-    for (p, r) in &link_parts {
+    let mut link_parts = link_parts;
+    for (p, r) in &mut link_parts {
         npairs += p.len();
-        for (k, b) in r {
-            reg.insert(*k, b.clone());
+        for (k, b) in r.drain(..) {
+            reg.entry(k).or_insert(b);
         }
     }
     // at most 2 * npairs distinct IDs; this keeps the load at or under 2/3
