@@ -59,3 +59,9 @@ noise between machines is up to ~20%, so compare with care.
 | 1723887 | cpp-unitdist | SS_UNIT=256, SS_DIST=24 | 0.7521 s |
 | 8e9be04 | cpp-chunk4m | SS_CHUNK=4 MiB | 0.7838 s |
 | 4a9822a | cpp-pgo | GCC 13 profile-guided build | 0.7562 s |
+
+## Rust pipeline (Somesh Agrawal), scorer v5
+| Commit | Branch | Change | Score |
+|---|---|---|---|
+| 40df30d | rust-somesh | plain static x86-64-v3 build | 0.6652 s |
+| 3bef6d7 | rust-pgo | PGO, trained on official-generator seeds 7 and 8 | **0.6450 s** (best) |
