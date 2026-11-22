@@ -44,3 +44,9 @@ noise between machines is up to ~20%, so compare with care.
 - BB-96A166C4 / BB-21CCABA8 — scorer probes: parse ends at ~0.58 s, write ends at ~1.13 s internal (fixed overhead ~0)
 - BB-1DB53ABD — exitrel @ f0d1c7a (parallel slab release before exit) — 1.1017 s (neutral)
 - BB-3AA013A0 — X_BITS=10 — 1.0895 s; BB-D39F9DA5 — X_BITS=11 — 2.3090 s (much worse)
+
+## Scorer v5 (Sat ~9 PM): new IDs (per-seed keyed bijection, 1 in 8 with a 32-char hex suffix); board rescored
+- BB-11F9334D X_BITS=8 — 2.1489 s; BB-C7B60C15 X_BITS=10 rerun — 2.0129 s (our old code on v5 data: long IDs hit the slow fallback path)
+- BB-0A4029F9 — longids @ cd96da9: word hash, no registry for event_id, deduplicated per-thread names — **1.2249 s**
+- BB-48FD127F — longids @ 34672a6: allocation-free link-name compare — **1.1767 s**
+- BB-7AA8FAEB — longids @ 9538a0f: append-only name log, sorted after parse — **1.1652 s** (54th; #1 is 0.60)
