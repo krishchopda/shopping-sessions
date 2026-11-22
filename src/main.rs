@@ -15,6 +15,7 @@
 //! FALLBACK-flagged hash key and its bytes are kept in a side registry.
 
 mod pq;
+mod plinks;
 use memchr::memchr;
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -206,6 +207,19 @@ fn key_anon(s: &[u8]) -> u64 {
             Some(k) => k,
             None => FALLBACK | (hash_bytes(s) >> 1),
         },
+    }
+}
+
+/// Like key_named, but never reads past the field (for unpadded mmaps).
+#[inline(always)]
+fn key_named_exact(s: &[u8], names: &mut Names) -> u64 {
+    match pack(s) {
+        Some(k) => k,
+        None => {
+            let k = FALLBACK | (hash_bytes(s) >> 1);
+            names.add(k, s);
+            k
+        }
     }
 }
 
@@ -753,6 +767,16 @@ struct Ev {
     flags: u8, // bit0 valid, bit1 purchase
 }
 
+/// Dedup record: one per well-formed event copy, bucketed by event_id.
+#[derive(Clone, Copy)]
+struct Sr {
+    eid: u64,
+    ingest: i32, // whole seconds relative to window_start
+    loc: u32,    // where the copy's person record is (thread, bucket, index), or NOLOC
+}
+const NOLOC: u32 = u32::MAX;
+const DEADTS: u32 = 1 << 31;
+
 #[derive(Clone, Copy)]
 struct Sv {
     person: u64,
@@ -916,6 +940,16 @@ impl<T: Copy> Buckets<T> {
     #[inline(always)]
     fn parts(&self, b: usize) -> (&[T], &[T]) {
         (self.main(b), &self.spill[b])
+    }
+    /// Raw pointer to element `i` of bucket `b` (after finish()).
+    #[inline(always)]
+    fn at(&self, b: usize, i: usize) -> *mut T {
+        let l = self.lens[b] as usize;
+        if i < l {
+            unsafe { self.ptr.add(b * self.cap + i) }
+        } else {
+            self.spill[b].as_ptr().wrapping_add(i - l) as *mut T
+        }
     }
 }
 impl<T: Copy> Drop for Buckets<T> {
@@ -1594,16 +1628,11 @@ fn main() {
     let organic = ncamp as u32;
     lap("small tables");
 
-    // ---- links run on their own thread, concurrently with event/click parsing
-    let link_dir = data_dir.join("links");
-    let links: Arc<std::sync::OnceLock<(U64Map, KeyMap<Vec<u8>>)>> = Arc::new(std::sync::OnceLock::new());
-    let links_w = links.clone();
-    let t0l = t0;
-    let link_handle = std::thread::spawn(move || {
-        let r = build_links(&link_dir, 2);
-        eprintln!("{:>8.1} ms  links built", t0l.elapsed().as_secs_f64() * 1e3);
-        let _ = links_w.set(r);
-    });
+    // ---- links first, on all threads: parsing can then send every event
+    // straight to its person's bucket
+    let (ptab, link_names) = plinks::build(&data_dir.join("links"), nt);
+    lap("links built");
+    let po = &ptab;
 
     // ---- events + clicks
     let ev_maps = map_files(&list_csv(&data_dir.join("events")));
@@ -1636,22 +1665,54 @@ fn main() {
     let sv_res = ev_bytes / 62 / nt / n_pb * 5 / 4 + 64;
 
     const BATCH: usize = 32;
+    // A valid event's person record goes straight to its person's bucket; its
+    // dedup record (all well-formed copies) to its event_id bucket, with the
+    // person record's location so dedup can mark losing copies dead in place.
     struct ParseSt {
-        evb: Buckets<Ev>,
+        tid: u32,
+        srb: Buckets<Sr>,
+        svb: Buckets<Sv>,
+        pos: Vec<(u32, u32)>, // per valid copy, in order: (person bucket, index)
         ckb: Buckets<Ck>,
         reg: Names,
         buf: Vec<u8>,
         cpend: Vec<Ck>,
+        epend: Vec<(Sr, Sv, bool)>,
+    }
+    let tbits = (usize::BITS - (nt.max(2) - 1).leading_zeros()) as u32;
+    let sbits = 32 - tbits;
+    let smask = (1u32 << sbits) - 1;
+    let tid_next = AtomicUsize::new(0);
+    #[inline(always)]
+    fn flush_events(st: &mut ParseSt, po: &plinks::PTable, ev_bits: u32, pb_bits: u32, sbits: u32) {
+        for k in 0..st.epend.len() {
+            let (mut sr, mut sv, valid) = st.epend[k];
+            if valid {
+                sv.person = po.get(sv.person).unwrap_or(sv.person);
+                let b = (mix(sv.person) >> (64 - pb_bits)) as usize;
+                let idx = st.svb.len(b) as u32;
+                let seq = st.pos.len() as u32;
+                st.pos.push((b as u32, idx));
+                st.svb.push(b, sv);
+                sr.loc = (st.tid << sbits) | seq;
+            }
+            st.srb.push((mix(sr.eid) >> (64 - ev_bits)) as usize, sr);
+        }
+        st.epend.clear();
     }
     let mut parsed = par_for(
         nt,
         total_tasks,
         || ParseSt {
-            evb: Buckets::new(n_evb, ev_res),
+            tid: tid_next.fetch_add(1, Ordering::Relaxed) as u32,
+            srb: Buckets::new(n_evb, ev_res),
+            svb: Buckets::new(n_pb, sv_res),
+            pos: Vec::with_capacity(ev_bytes / 62 / nt + 1024),
             ckb: Buckets::new(n_pb, ck_res),
             reg: Names::with_capacity((ev_bytes + ck_bytes) / 64 / nt + 1024),
             buf: Vec::new(),
             cpend: Vec::with_capacity(BATCH),
+            epend: Vec::with_capacity(BATCH),
         },
         |st, i| {
             if i < ev_chunks.len() {
@@ -1689,23 +1750,24 @@ fn main() {
                     if valid && ingest_ms - ts > DAY {
                         valid = false;
                     }
-                    let flags = valid as u8 | ((purchase as u8) << 1);
+                    let sr = Sr { eid, ingest, loc: NOLOC };
                     if valid {
                         let uid = key_named(f[1], &mut st.reg);
                         let cat = if purchase { prod_lu.get(f[5]).map(|c| c as u16).unwrap_or(unknown_cat) } else { 0 };
-                        let b = (mix(eid) >> (64 - ev_bits)) as usize;
-                        st.evb.push(b, Ev { eid, person: uid, ts: (ts - ws) as u32, ingest, price, cat, flags });
+                        po.prefetch(uid);
+                        let pc = if purchase { (price << 8) | cat as u32 } else { 0 };
+                        st.epend.push((sr, Sv { person: uid, ts: (ts - ws) as u32, pc }, true));
                     } else {
-                        let b = (mix(eid) >> (64 - ev_bits)) as usize;
-                        st.evb.push(b, Ev { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, flags });
+                        st.epend.push((sr, Sv { person: 0, ts: 0, pc: 0 }, false));
+                    }
+                    if st.epend.len() == BATCH {
+                        flush_events(st, po, ev_bits, pb_bits, sbits);
                     }
                 });
+                flush_events(st, po, ev_bits, pb_bits, sbits);
                 st.buf = buf;
             } else {
                 let c = &ck_chunks[i - ev_chunks.len()];
-                // click chunks are queued after every event chunk; the link
-                // thread has normally finished by the time one starts
-                let (po, _) = links.wait();
                 let mut buf = std::mem::take(&mut st.buf);
                 let data: &[u8] = if use_mmap && c.end + 64 <= ck_maps[c.file].len() { &ck_maps[c.file][c.start..c.end] } else { read_chunk(&mut buf, &ck_files[c.file], c) };
                 scan_lines(data, |f: &[&[u8]; 4]| {
@@ -1743,16 +1805,17 @@ fn main() {
             }
         },
     );
+    // locations name threads by tid: index the states the same way
+    parsed.sort_by_key(|s| s.tid);
     for st in &mut parsed {
-        st.evb.finish();
+        st.srb.finish();
+        st.svb.finish();
         st.ckb.finish();
     }
     lap("parse events+clicks");
     if stop_after_parse {
         unsafe { libc::_exit(0) };
     }
-    link_handle.join().unwrap();
-    let (person_of, link_reg) = Arc::try_unwrap(links).ok().expect("links still shared").into_inner().expect("links built");
     let mut name_parts: Vec<Names> = parsed.iter_mut().map(|st| std::mem::replace(&mut st.reg, Names::new())).collect();
     std::thread::scope(|sc| {
         for p in name_parts.iter_mut() {
@@ -1761,21 +1824,32 @@ fn main() {
             }
         }
     });
-    let reg = AllNames { links: link_reg, parts: name_parts };
-    lap("links joined");
-    let person_of_ref = &person_of;
+    name_parts.extend(link_names);
+    let reg = AllNames { links: KeyMap::default(), parts: name_parts };
+    lap("names sorted");
 
     // clicks were resolved and partitioned by person during parsing
     let ck_parts: Vec<Buckets<Ck>> = parsed.iter_mut().map(|st| std::mem::replace(&mut st.ckb, Buckets::new(1, 1))).collect();
 
-    // ---- dedup
+    // ---- dedup: per event_id bucket, the copy with the smallest ingest_ts
+    // wins (first seen on ties); every other copy's person record is marked
+    // dead where it lies. A winner that is invalid has no record, so all of
+    // that event's copies end up dead.
     let parsed_ref = &parsed;
-    let dedup = par_for(
+    let kill = |loc: u32| {
+        if loc == NOLOC {
+            return;
+        }
+        let st = &parsed_ref[(loc >> sbits) as usize];
+        let (b, idx) = st.pos[(loc & smask) as usize];
+        unsafe { (*st.svb.at(b as usize, idx as usize)).ts |= DEADTS };
+    };
+    par_for(
         nt,
         n_evb,
-        || (Buckets::<Sv>::new(n_pb, sv_res), Vec::<(u64, i32, u32)>::new(), Vec::<u32>::new(), Vec::<Sv>::with_capacity(BATCH)),
-        |(out, table, losers, pend), b| {
-            let n: usize = parsed_ref.iter().map(|s| s.evb.len(b)).sum();
+        || Vec::<(u64, i32, u32)>::new(),
+        |table, b| {
+            let n: usize = parsed_ref.iter().map(|s| s.srb.len(b)).sum();
             if n == 0 {
                 return;
             }
@@ -1784,26 +1858,23 @@ fn main() {
             let t0 = std::time::Instant::now();
             table.clear();
             table.resize(cap, (u64::MAX, 0, 0));
-            losers.clear();
-            // pass 1: (eid -> min ingest, winner id); record every loser id
-            for (ti, s) in parsed_ref.iter().enumerate() {
-                let (m0, m1) = s.evb.parts(b);
-                for (i, e) in m0.iter().chain(m1.iter()).enumerate() {
-                    let id = ((ti as u32) << 26) | i as u32;
+            for s in parsed_ref.iter() {
+                let (m0, m1) = s.srb.parts(b);
+                for e in m0.iter().chain(m1.iter()) {
                     let mut h = (mix(e.eid) >> 8) as usize & mask;
                     loop {
                         let t = &mut table[h];
                         if t.0 == u64::MAX {
-                            *t = (e.eid, e.ingest, id);
+                            *t = (e.eid, e.ingest, e.loc);
                             break;
                         }
                         if t.0 == e.eid {
                             if e.ingest < t.1 {
-                                losers.push(t.2);
+                                kill(t.2);
                                 t.1 = e.ingest;
-                                t.2 = id;
+                                t.2 = e.loc;
                             } else {
-                                losers.push(id);
+                                kill(e.loc);
                             }
                             break;
                         }
@@ -1811,50 +1882,16 @@ fn main() {
                     }
                 }
             }
-            let t0 = prof(0, t0);
-            losers.sort_unstable();
-            let t0 = prof(1, t0);
-            // pass 2: sequential scan, skipping losers and invalid kept copies
-            let mut li = 0usize;
-            for (ti, s) in parsed_ref.iter().enumerate() {
-                let (m0, m1) = s.evb.parts(b);
-                for (i, e) in m0.iter().chain(m1.iter()).enumerate() {
-                    let id = ((ti as u32) << 26) | i as u32;
-                    if li < losers.len() && losers[li] == id {
-                        li += 1;
-                        continue;
-                    }
-                    if e.flags & 1 == 0 {
-                        continue;
-                    }
-                    person_of_ref.prefetch(e.person);
-                    pend.push(Sv { person: e.person, ts: e.ts, pc: if e.flags & 2 != 0 { (e.price << 8) | e.cat as u32 } else { 0 } });
-                    if pend.len() == BATCH {
-                        for mut v in pend.drain(..) {
-                            v.person = person_of_ref.get(v.person).unwrap_or(v.person);
-                            out.push((mix(v.person) >> (64 - pb_bits)) as usize, v);
-                        }
-                    }
-                }
-            }
-            for mut v in pend.drain(..) {
-                v.person = person_of_ref.get(v.person).unwrap_or(v.person);
-                out.push((mix(v.person) >> (64 - pb_bits)) as usize, v);
-            }
-            prof(2, t0);
+            prof(0, t0);
         },
     );
     for st in &mut parsed {
-        st.evb = Buckets::new(1, 1);
-    }
-    let mut dedup = dedup;
-    for d in &mut dedup {
-        d.0.finish();
+        st.srb = Buckets::new(1, 1);
+        st.pos = Vec::new();
     }
     lap("dedup");
 
     // ---- sessions
-    let dedup_ref = &dedup;
     let ck_parts_ref = &ck_parts;
     let parsed_ref = &parsed;
     let reg_ref = &reg;
@@ -1883,7 +1920,7 @@ fn main() {
             // Group by person in linear time: dense person index via a small
             // hash table, counting sort by index, then sort each person's few
             // records by time.
-            let n: usize = dedup_ref.iter().map(|d| d.0.len(b)).sum();
+            let n: usize = parsed_ref.iter().map(|d| d.svb.len(b)).sum();
             if n == 0 {
                 return;
             }
@@ -1893,13 +1930,17 @@ fn main() {
             st.pt.reset(n / 4 + 64);
             st.pidx.clear();
             st.persons.clear();
-            for (o, _, _, _) in dedup_ref.iter() {
-                let (m0, m1) = o.parts(b);
+            for o in parsed_ref.iter() {
+                let (m0, m1) = o.svb.parts(b);
                 for e in m0.iter().chain(m1.iter()) {
+                    if e.ts & DEADTS != 0 {
+                        continue;
+                    }
                     let ix = st.pt.get_or_insert(e.person, &mut st.persons);
                     st.pidx.push(ix);
                 }
             }
+            let n = st.pidx.len();
             let np = st.persons.len();
             st.eoff.clear();
             st.eoff.resize(np + 1, 0);
@@ -1915,9 +1956,12 @@ fn main() {
             evs.reserve(n);
             unsafe { evs.set_len(n) };
             let mut k = 0usize;
-            for (o, _, _, _) in dedup_ref.iter() {
-                let (m0, m1) = o.parts(b);
+            for o in parsed_ref.iter() {
+                let (m0, m1) = o.svb.parts(b);
                 for e in m0.iter().chain(m1.iter()) {
+                    if e.ts & DEADTS != 0 {
+                        continue;
+                    }
                     let ix = st.pidx[k] as usize;
                     k += 1;
                     let at = st.cur[ix];
@@ -2078,7 +2122,6 @@ fn main() {
             st.cks = cks;
         },
     );
-    drop(dedup);
     lap("sessions");
 
     // ---- output
