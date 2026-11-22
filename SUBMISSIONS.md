@@ -88,3 +88,4 @@ noise between machines is up to ~20%, so compare with care.
 | 0754cd8 | par-release | re-run (defending top 30) | 0.6519 s |
 | 713980e | knob-pfd1k | re-run (defending top 30) | 0.6648 s |
 | 0754cd8 | par-release | re-run (defending top 30) | 0.6539 s |
+| 713980e | knob-pfd1k | re-run (defending top 30) | 0.6502 s |
