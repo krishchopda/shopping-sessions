@@ -93,3 +93,4 @@ noise between machines is up to ~20%, so compare with care.
 | 713980e | knob-pfd1k | re-run (defending top 30) | 0.6613 s |
 | 0754cd8 | par-release | re-run (defending top 30) | 0.8133 s (scorer heavily loaded) |
 | 713980e | knob-pfd1k | re-run (defending top 30) | 0.6675 s |
+| 0754cd8 | par-release | re-run (defending top 30) | 0.6585 s (now 31st; 30th place 0.6272) |
