@@ -4033,7 +4033,8 @@ fn main() {
         let lap_done = t0.elapsed().as_secs_f64();
         let (a, b) = if m == "1" { (lap_parse, lap_dedup - lap_parse) } else { (lap_sess - lap_dedup, lap_done - lap_sess) };
         let cs = |d: f64| (d * 100.0).round().clamp(0.0, 99.0);
-        let target = 10.0 + 0.1 * cs(a) + 0.001 * cs(b);
+        // PROBE=3: the write lap alone, 0.01 s per ms
+        let target = if m == "3" { 10.0 + 0.01 * ((lap_done - lap_sess) * 1000.0).round().clamp(0.0, 999.0) } else { 10.0 + 0.1 * cs(a) + 0.001 * cs(b) };
         let now = t0.elapsed().as_secs_f64();
         if target > now {
             std::thread::sleep(std::time::Duration::from_secs_f64(target - now));
