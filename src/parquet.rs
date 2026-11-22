@@ -386,3 +386,183 @@ pub fn write_cols(path: &std::path::Path, cols: &[ColRef], nrows: usize) -> std:
 pub fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
+
+/// How a column's values are stored: PLAIN bytes, or a dictionary (its values
+/// PLAIN-encoded, `ndict` of them) and one index per non-null row.
+pub enum Enc<'a> {
+    Plain(&'a [u8]),
+    Dict { dict: Vec<u8>, ndict: usize, idx: &'a [u32] },
+}
+
+pub struct DCol<'a> {
+    pub name: &'static str,
+    pub ty: Ty,
+    pub defs: Option<&'a [u8]>,
+    pub enc: Enc<'a>,
+}
+
+/// The indices as one bit-packed run of the RLE/bit-packed hybrid (LSB first,
+/// groups of eight, the last one padded with zeros).
+fn bitpack(idx: &[u32], w: u32, out: &mut Vec<u8>) {
+    let n = idx.len();
+    let groups = (n + 7) / 8;
+    varint_bytes(((groups as u64) << 1) | 1, out);
+    out.reserve(groups * w as usize);
+    let mut acc: u64 = 0;
+    let mut nb: u32 = 0;
+    for i in 0..groups * 8 {
+        let v = if i < n { idx[i] as u64 } else { 0 };
+        acc |= v << nb;
+        nb += w;
+        while nb >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            nb -= 8;
+        }
+    }
+}
+
+/// `write_cols` where a column may be dictionary-encoded (a dictionary page, then
+/// one RLE_DICTIONARY data page of bit-packed indices): far fewer bytes for
+/// columns with few distinct values or long runs.
+pub fn write_dcols(path: &std::path::Path, cols: &[DCol], nrows: usize) -> std::io::Result<()> {
+    let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+    f.write_all(b"PAR1")?;
+    let mut pos = 4i64;
+    // (type, name, column start, column bytes, data page offset, dictionary?)
+    let mut metas: Vec<(i32, &'static str, i64, i64, i64, bool)> = Vec::new();
+    for c in cols {
+        let ty = match c.ty {
+            Ty::Str => T_BYTE_ARRAY,
+            Ty::Date | Ty::I32 => T_INT32,
+            Ty::I64 => T_INT64,
+        };
+        let start = pos;
+        let mut dl: Vec<u8> = Vec::new();
+        if let Some(d) = c.defs {
+            let groups = (nrows + 7) / 8;
+            assert_eq!(d.len(), groups);
+            let mut hdr = Vec::new();
+            varint_bytes(((groups as u64) << 1) | 1, &mut hdr);
+            dl.extend_from_slice(&((hdr.len() + groups) as u32).to_le_bytes());
+            dl.extend_from_slice(&hdr);
+        }
+        let defs_len = dl.len() + c.defs.map_or(0, |d| d.len());
+        let (is_dict, body_owned, body_ref): (bool, Vec<u8>, &[u8]) = match &c.enc {
+            Enc::Plain(data) => (false, Vec::new(), data),
+            Enc::Dict { dict, ndict, idx } => {
+                // dictionary page
+                let mut h = T::new();
+                h.i32f(1, 2); // DICTIONARY_PAGE
+                h.i32f(2, dict.len() as i32);
+                h.i32f(3, dict.len() as i32);
+                h.begin_struct(7);
+                h.i32f(1, *ndict as i32);
+                h.i32f(2, 0); // PLAIN
+                h.end_struct();
+                h.b.push(0);
+                f.write_all(&h.b)?;
+                f.write_all(dict)?;
+                pos += (h.b.len() + dict.len()) as i64;
+                let w = if *ndict <= 1 { 1 } else { 64 - ((*ndict - 1) as u64).leading_zeros() };
+                let mut b = vec![w as u8];
+                bitpack(idx, w, &mut b);
+                (true, b, &[][..])
+            }
+        };
+        let body: &[u8] = if is_dict { &body_owned } else { body_ref };
+        let page = defs_len + body.len();
+        let mut h = T::new();
+        h.i32f(1, 0); // DATA_PAGE
+        h.i32f(2, page as i32);
+        h.i32f(3, page as i32);
+        h.begin_struct(5);
+        h.i32f(1, nrows as i32);
+        h.i32f(2, if is_dict { 8 } else { 0 }); // RLE_DICTIONARY or PLAIN
+        h.i32f(3, 3); // RLE
+        h.i32f(4, 3); // RLE
+        h.end_struct();
+        h.b.push(0);
+        let data_off = pos;
+        f.write_all(&h.b)?;
+        if let Some(d) = c.defs {
+            f.write_all(&dl)?;
+            f.write_all(d)?;
+        }
+        f.write_all(body)?;
+        pos += (h.b.len() + page) as i64;
+        metas.push((ty, c.name, start, pos - start, data_off, is_dict));
+    }
+    let mut m = T::new();
+    m.i32f(1, 1);
+    m.list(2, 12, cols.len() + 1);
+    m.begin_struct_elem();
+    m.strf(4, b"schema");
+    m.i32f(5, cols.len() as i32);
+    m.end_struct();
+    for (c, meta) in cols.iter().zip(&metas) {
+        m.begin_struct_elem();
+        m.i32f(1, meta.0);
+        m.i32f(3, if c.defs.is_some() { 1 } else { 0 });
+        m.strf(4, c.name.as_bytes());
+        let (conv, logical): (Option<i32>, Option<i16>) = match c.ty {
+            Ty::Str => (Some(0), Some(1)),
+            Ty::Date => (Some(6), Some(6)),
+            Ty::I32 | Ty::I64 => (None, None),
+        };
+        if let Some(cv) = conv {
+            m.i32f(6, cv);
+        }
+        if let Some(l) = logical {
+            m.begin_struct(10);
+            m.begin_struct(l);
+            m.end_struct();
+            m.end_struct();
+        }
+        m.end_struct();
+    }
+    m.i64f(3, nrows as i64);
+    m.list(4, 12, 1);
+    m.begin_struct_elem();
+    m.list(1, 12, cols.len());
+    let mut total = 0i64;
+    for meta in &metas {
+        total += meta.3;
+        m.begin_struct_elem();
+        m.i64f(2, meta.2);
+        m.begin_struct(3);
+        m.i32f(1, meta.0);
+        if meta.5 {
+            m.list(2, 5, 3);
+            m.zz(0); // PLAIN
+            m.zz(3); // RLE
+            m.zz(8); // RLE_DICTIONARY
+        } else {
+            m.list(2, 5, 2);
+            m.zz(0);
+            m.zz(3);
+        }
+        m.list(3, 8, 1);
+        m.varint(meta.1.len() as u64);
+        m.b.extend_from_slice(meta.1.as_bytes());
+        m.i32f(4, 0); // UNCOMPRESSED
+        m.i64f(5, nrows as i64);
+        m.i64f(6, meta.3);
+        m.i64f(7, meta.3);
+        m.i64f(9, meta.4);
+        if meta.5 {
+            m.i64f(11, meta.2);
+        }
+        m.end_struct();
+        m.end_struct();
+    }
+    m.i64f(2, total);
+    m.i64f(3, nrows as i64);
+    m.end_struct();
+    m.b.push(0);
+    f.write_all(&m.b)?;
+    f.write_all(&(m.b.len() as u32).to_le_bytes())?;
+    f.write_all(b"PAR1")?;
+    f.flush()?;
+    Ok(())
+}

@@ -2748,14 +2748,20 @@ fn cpu_now() -> f64 {
     ts.sec as f64 + ts.nsec as f64 * 1e-9
 }
 
-/// user_daily rows of one thread, already in the layout the Parquet page needs.
+/// user_daily rows of one thread. user_id and top_category are kept as dictionary
+/// indices (a thread writes each person's rows together, so the person's name goes
+/// into the dictionary once, when the person starts).
 struct UserCols {
-    uid: Vec<u8>,
+    /// the names, PLAIN-encoded (4-byte length + bytes), one per person
+    uid_dict: Vec<u8>,
+    nuid: u32,
+    uid_idx: Vec<u32>,
     day: Vec<i32>,
     sess: Vec<i32>,
     ev: Vec<i32>,
     rev: Vec<i64>,
-    top: Vec<u8>,
+    /// category index of each row that has a top_category
+    top_idx: Vec<u32>,
     /// one bit per row: top_category is present
     defs: Vec<u8>,
     n: usize,
@@ -2763,12 +2769,18 @@ struct UserCols {
 
 impl UserCols {
     fn new() -> Self {
-        UserCols { uid: Vec::new(), day: Vec::new(), sess: Vec::new(), ev: Vec::new(), rev: Vec::new(), top: Vec::new(), defs: Vec::new(), n: 0 }
+        UserCols { uid_dict: Vec::new(), nuid: 0, uid_idx: Vec::new(), day: Vec::new(), sess: Vec::new(), ev: Vec::new(), rev: Vec::new(), top_idx: Vec::new(), defs: Vec::new(), n: 0 }
+    }
+    /// The rows pushed from now on are this person's.
+    #[inline(always)]
+    fn begin_person(&mut self, name: &[u8]) {
+        self.uid_dict.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        self.uid_dict.extend_from_slice(name);
+        self.nuid += 1;
     }
     #[inline(always)]
-    fn push(&mut self, name: &[u8], day: i32, s: i64, ev: i64, rev: i64, top: Option<&[u8]>) {
-        self.uid.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        self.uid.extend_from_slice(name);
+    fn push(&mut self, day: i32, s: i64, ev: i64, rev: i64, top: Option<u32>) {
+        self.uid_idx.push(self.nuid - 1);
         self.day.push(day);
         self.sess.push(s as i32);
         self.ev.push(ev as i32);
@@ -2777,12 +2789,30 @@ impl UserCols {
             self.defs.push(0);
         }
         if let Some(c) = top {
-            self.top.extend_from_slice(&(c.len() as u32).to_le_bytes());
-            self.top.extend_from_slice(c);
+            self.top_idx.push(c);
             *self.defs.last_mut().unwrap() |= 1 << (self.n & 7);
         }
         self.n += 1;
     }
+}
+
+fn enc_of<'a>(d: Option<(Vec<u8>, usize)>, idx: &'a [u32], plain: &'a [u8]) -> parquet::Enc<'a> {
+    match d {
+        Some((dict, ndict)) => parquet::Enc::Dict { dict, ndict, idx },
+        None => parquet::Enc::Plain(plain),
+    }
+}
+
+/// A dictionary of the consecutive integers lo..=hi (PLAIN int32) and each value's
+/// index in it, or None when the range is too wide to be worth it.
+fn int_dict(v: &[i32]) -> Option<(Vec<u8>, usize, Vec<u32>)> {
+    let lo = *v.iter().min()?;
+    let hi = *v.iter().max()?;
+    if (hi as i64 - lo as i64) >= 1 << 16 {
+        return None;
+    }
+    let dict: Vec<u8> = (lo..=hi).flat_map(|x| x.to_le_bytes()).collect();
+    Some((dict, (hi - lo + 1) as usize, v.iter().map(|&x| (x - lo) as u32).collect()))
 }
 
 /// What a parse thread needs to turn an event row into a record.
@@ -3796,6 +3826,7 @@ fn main() {
                             name.clear();
                             key_bytes(pk, PFX_USER, &mut name);
                             let name = &name[..];
+                            cols.begin_person(name);
                             let e = &mut evs[estart[li] as usize..estart[li + 1] as usize];
                             if xp(16) { continue; }
                             if e.len() <= bsmin {
@@ -3822,18 +3853,18 @@ fn main() {
                             let mut d_rev = 0i64;
                             let mut k = 0usize;
                             let flush = |cols: &mut UserCols, catrev: &mut Vec<i64>, day: i64, s: i64, ev: i64, rev: i64| {
-                                let mut top: Option<&[u8]> = None;
+                                let mut top: Option<u32> = None;
                                 let mut bestv = 0i64;
                                 if rev > 0 {
                                     for (ci, v) in catrev.iter_mut().enumerate() {
                                         if *v > bestv {
                                             bestv = *v;
-                                            top = Some(&cat_names[ci][..]);
+                                            top = Some(ci as u32);
                                         }
                                         *v = 0;
                                     }
                                 }
-                                cols.push(name, day as i32, s, ev, rev, top);
+                                cols.push(day as i32, s, ev, rev, top);
                             };
                             let en = e.len();
                             let ep = e.as_ptr();
@@ -3970,15 +4001,27 @@ fn main() {
             let ud = &ud;
             sc.spawn(move || {
                 let c = &r.cols;
+                use parquet::{DCol, Enc, Ty};
+                let cat_dict: Vec<u8> = cat_names.iter().flat_map(|n| (n.len() as u32).to_le_bytes().into_iter().chain(n.iter().copied())).collect();
+                let (dd, sd, ed) = (int_dict(&c.day), int_dict(&c.sess), int_dict(&c.ev));
+                let mk = |d: &'_ Option<(Vec<u8>, usize, Vec<u32>)>, raw: &[i32]| -> (Option<(Vec<u8>, usize)>, Vec<u32>, Vec<u8>) {
+                    match d {
+                        Some((dict, n, idx)) => (Some((dict.clone(), *n)), idx.clone(), Vec::new()),
+                        None => (None, Vec::new(), parquet::bytes_of(raw).to_vec()),
+                    }
+                };
+                let (dday, iday, pday) = mk(&dd, &c.day);
+                let (dses, ises, pses) = mk(&sd, &c.sess);
+                let (devs, ievs, pevs) = mk(&ed, &c.ev);
                 let cols = [
-                    parquet::ColRef { name: "user_id", ty: parquet::Ty::Str, defs: None, data: &c.uid },
-                    parquet::ColRef { name: "day", ty: parquet::Ty::Date, defs: None, data: parquet::bytes_of(&c.day) },
-                    parquet::ColRef { name: "sessions", ty: parquet::Ty::I32, defs: None, data: parquet::bytes_of(&c.sess) },
-                    parquet::ColRef { name: "events", ty: parquet::Ty::I32, defs: None, data: parquet::bytes_of(&c.ev) },
-                    parquet::ColRef { name: "revenue_cents", ty: parquet::Ty::I64, defs: None, data: parquet::bytes_of(&c.rev) },
-                    parquet::ColRef { name: "top_category", ty: parquet::Ty::Str, defs: Some(&c.defs), data: &c.top },
+                    DCol { name: "user_id", ty: Ty::Str, defs: None, enc: Enc::Dict { dict: c.uid_dict.clone(), ndict: c.nuid as usize, idx: &c.uid_idx } },
+                    DCol { name: "day", ty: Ty::Date, defs: None, enc: enc_of(dday, &iday, &pday) },
+                    DCol { name: "sessions", ty: Ty::I32, defs: None, enc: enc_of(dses, &ises, &pses) },
+                    DCol { name: "events", ty: Ty::I32, defs: None, enc: enc_of(devs, &ievs, &pevs) },
+                    DCol { name: "revenue_cents", ty: Ty::I64, defs: None, enc: Enc::Plain(parquet::bytes_of(&c.rev)) },
+                    DCol { name: "top_category", ty: Ty::Str, defs: Some(&c.defs), enc: Enc::Dict { dict: cat_dict.clone(), ndict: cat_names.len(), idx: &c.top_idx } },
                 ];
-                parquet::write_cols(&ud.join(format!("part-{:03}.parquet", t)), &cols, c.n).unwrap();
+                parquet::write_dcols(&ud.join(format!("part-{:03}.parquet", t)), &cols, c.n).unwrap();
             });
         }
     // campaign_daily on this thread meanwhile
