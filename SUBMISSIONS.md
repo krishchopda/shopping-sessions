@@ -81,3 +81,4 @@ noise between machines is up to ~20%, so compare with care.
 | 3bef6d7 | rust-pgo | re-run (defending top 30) | 0.6541 s |
 | 0754cd8 | par-release | re-run (defending top 30) | 0.6434 s |
 | 713980e | knob-pfd1k | re-run (defending top 30) | **0.6398 s** (best so far, rank 26) |
+| 0754cd8 | par-release | re-run (defending top 30) | 0.6584 s |
