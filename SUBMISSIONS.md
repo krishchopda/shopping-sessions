@@ -50,3 +50,12 @@ noise between machines is up to ~20%, so compare with care.
 - BB-0A4029F9 — longids @ cd96da9: word hash, no registry for event_id, deduplicated per-thread names — **1.2249 s**
 - BB-48FD127F — longids @ 34672a6: allocation-free link-name compare — **1.1767 s**
 - BB-7AA8FAEB — longids @ 9538a0f: append-only name log, sorted after parse — **1.1652 s** (54th; #1 is 0.60)
+
+## C++ pipeline (Somesh Agrawal), scorer v5
+| Commit | Branch | Change | Score |
+|---|---|---|---|
+| 1e23e0d | cpp-somesh | baseline, -O3 -march=x86-64-v3, static | **0.7497 s** (best) |
+| a0a1ede | cpp-clx | -march=cascadelake | 0.7535 s |
+| 1723887 | cpp-unitdist | SS_UNIT=256, SS_DIST=24 | 0.7521 s |
+| 8e9be04 | cpp-chunk4m | SS_CHUNK=4 MiB | 0.7838 s |
+| 4a9822a | cpp-pgo | GCC 13 profile-guided build | 0.7562 s |
