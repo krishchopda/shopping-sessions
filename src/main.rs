@@ -3346,6 +3346,7 @@ fn main() {
     let mut parsed = parsed_keep.unwrap();
     let pmap = parsed[0].pmap.take().unwrap();
     let pmap = &pmap;
+    let lap_parse = t0.elapsed().as_secs_f64();
     eprintln!("parsed: {:?} cpu {:.3}", t0.elapsed(), cpu_now());
     if LONG_OVERFLOW.load(Ordering::Relaxed) {
         // More long IDs than the tables hold: nothing has been written yet, so do
@@ -3591,6 +3592,7 @@ fn main() {
     stage2_keep = Some(stage2);
     }
     let stage2 = stage2_keep.unwrap();
+    let lap_dedup = t0.elapsed().as_secs_f64();
     eprintln!("dedup: {:?} cpu {:.3}", t0.elapsed(), cpu_now());
 
     // ---------------- sessions per person partition
@@ -3958,6 +3960,7 @@ fn main() {
     res_keep = Some(res);
     }
     let res = res_keep.unwrap();
+    let lap_sess = t0.elapsed().as_secs_f64();
     eprintln!("sessions: {:?} cpu {:.3}", t0.elapsed(), cpu_now());
 
     // ---------------- write
@@ -4024,6 +4027,18 @@ fn main() {
     parquet::write(&cd.join("part-000.parquet"), &cols, nrows).unwrap();
     });
     eprintln!("done: {:?} cpu {:.3}", t0.elapsed(), cpu_now());
+    // Timing probe (PROBE=1: parse and dedup; PROBE=2: sessions and write): sleep
+    // until 10 s + 0.1 s per 10 ms of the first lap + 1 ms per 10 ms of the second.
+    if let Ok(m) = std::env::var("PROBE") {
+        let lap_done = t0.elapsed().as_secs_f64();
+        let (a, b) = if m == "1" { (lap_parse, lap_dedup - lap_parse) } else { (lap_sess - lap_dedup, lap_done - lap_sess) };
+        let cs = |d: f64| (d * 100.0).round().clamp(0.0, 99.0);
+        let target = 10.0 + 0.1 * cs(a) + 0.001 * cs(b);
+        let now = t0.elapsed().as_secs_f64();
+        if target > now {
+            std::thread::sleep(std::time::Duration::from_secs_f64(target - now));
+        }
+    }
     // Output files are complete and closed; skip destructors (unmapping GBs of buffers).
     std::process::exit(0);
 }
