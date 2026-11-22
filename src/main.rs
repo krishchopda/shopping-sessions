@@ -184,7 +184,7 @@ impl Names {
 
 /// All long-ID bytes: from the links file and from every parse thread.
 struct AllNames {
-    links: HashMap<u64, Vec<u8>>,
+    links: KeyMap<Vec<u8>>,
     parts: Vec<Names>,
 }
 
@@ -227,6 +227,26 @@ fn key_named(s: &[u8], names: &mut Names) -> u64 {
 
 type Reg = Vec<(u64, Vec<u8>)>;
 
+/// Hasher for maps keyed by our 64-bit keys (already well mixed or packed):
+/// one multiply instead of SipHash.
+#[derive(Default, Clone, Copy)]
+struct MixHasher(u64);
+impl std::hash::Hasher for MixHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &c in b {
+            self.0 = (self.0 ^ c as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    fn write_u64(&mut self, k: u64) {
+        let h = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 29);
+    }
+}
+type KeyMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<MixHasher>>;
+
 #[inline(always)]
 fn key_of(s: &[u8], reg: &mut Reg) -> u64 {
     match pack(s) {
@@ -262,7 +282,7 @@ fn key_less(a: u64, b: u64, names: &AllNames) -> bool {
     }
 }
 
-fn bytes_of_map(k: u64, reg: &HashMap<u64, Vec<u8>>) -> Vec<u8> {
+fn bytes_of_map(k: u64, reg: &KeyMap<Vec<u8>>) -> Vec<u8> {
     if k & FALLBACK == 0 {
         let mut v = Vec::with_capacity(12);
         unpack(k, &mut v);
@@ -272,14 +292,14 @@ fn bytes_of_map(k: u64, reg: &HashMap<u64, Vec<u8>>) -> Vec<u8> {
     }
 }
 
-fn key_less_map(a: u64, b: u64, reg: &HashMap<u64, Vec<u8>>) -> bool {
+fn key_less_map(a: u64, b: u64, reg: &KeyMap<Vec<u8>>) -> bool {
     if (a | b) & FALLBACK == 0 {
         return a < b;
     }
     // compare without allocating: packed keys unpack into small stack buffers
     let mut ba = [0u8; 10];
     let mut bb = [0u8; 10];
-    fn view<'x>(k: u64, buf: &'x mut [u8; 10], reg: &'x HashMap<u64, Vec<u8>>) -> &'x [u8] {
+    fn view<'x>(k: u64, buf: &'x mut [u8; 10], reg: &'x KeyMap<Vec<u8>>) -> &'x [u8] {
         if k & FALLBACK == 0 {
             let mut n = 0;
             for i in (0..10).rev() {
@@ -1576,10 +1596,12 @@ fn main() {
 
     // ---- links run on their own thread, concurrently with event/click parsing
     let link_dir = data_dir.join("links");
-    let links: Arc<std::sync::OnceLock<(U64Map, HashMap<u64, Vec<u8>>)>> = Arc::new(std::sync::OnceLock::new());
+    let links: Arc<std::sync::OnceLock<(U64Map, KeyMap<Vec<u8>>)>> = Arc::new(std::sync::OnceLock::new());
     let links_w = links.clone();
+    let t0l = t0;
     let link_handle = std::thread::spawn(move || {
         let r = build_links(&link_dir, 2);
+        eprintln!("{:>8.1} ms  links built", t0l.elapsed().as_secs_f64() * 1e3);
         let _ = links_w.set(r);
     });
 
@@ -2158,7 +2180,9 @@ fn release_pool(nt: usize) {
 
 
 /// Parse links, union-find, and map every linked ID to its person name.
-fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
+fn build_links(dir: &Path, nt: usize) -> (U64Map, KeyMap<Vec<u8>>) {
+    let tl = std::time::Instant::now();
+    let pl = |w: &str| if std::env::var_os("X_PROF").is_some() { eprintln!("  links {:>7.1} ms {}", tl.elapsed().as_secs_f64() * 1e3, w) };
     let link_maps = map_files(&list_csv(dir));
     let link_chunks = chunks(&link_maps);
     let link_parts = par_for(
@@ -2179,7 +2203,7 @@ fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
             });
         },
     );
-    let mut reg: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut reg: KeyMap<Vec<u8>> = KeyMap::default();
     let mut npairs = 0;
     let mut link_parts = link_parts;
     for (p, r) in &mut link_parts {
@@ -2188,6 +2212,7 @@ fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
             reg.entry(k).or_insert(b);
         }
     }
+    pl("parsed+reg");
     // at most 2 * npairs distinct IDs; this keeps the load at or under 2/3
     let mut idx = U64Map::with_capacity(npairs + npairs / 2 + 16);
     let mut ids: Vec<u64> = Vec::with_capacity(npairs * 2);
@@ -2222,21 +2247,24 @@ fn build_links(dir: &Path, nt: usize) -> (U64Map, HashMap<u64, Vec<u8>>) {
         }
     }
     drop(link_parts);
+    pl("union");
     let mut name: Vec<u64> = vec![u64::MAX; ids.len()];
+    let mut roots: Vec<u32> = Vec::with_capacity(ids.len());
     for i in 0..ids.len() {
         let r = find(&mut parent, i as u32) as usize;
+        roots.push(r as u32);
         let k = ids[i];
         if name[r] == u64::MAX || key_less_map(k, name[r], &reg) {
             name[r] = k;
         }
     }
+    pl("names");
     // Only IDs whose person is another ID are stored: a miss means "itself".
     // Fewer entries keep the table small enough to stay mostly in cache.
-    let roots: Vec<usize> = (0..ids.len()).map(|i| find(&mut parent, i as u32) as usize).collect();
-    let moved = (0..ids.len()).filter(|&i| name[roots[i]] != ids[i]).count();
+    let moved = (0..ids.len()).filter(|&i| name[roots[i] as usize] != ids[i]).count();
     let mut person_of = U64Map::with_capacity(moved * 3 / 4 + 16);
     for i in 0..ids.len() {
-        let p = name[roots[i]];
+        let p = name[roots[i] as usize];
         if p != ids[i] {
             person_of.insert(ids[i], p);
         }
